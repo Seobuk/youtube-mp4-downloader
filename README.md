@@ -7,7 +7,17 @@ yt-dlp + ffmpeg 기반, PyQt6 GUI. 유튜브 링크를 붙여넣고 버튼 한 �
 - **PPT 호환**: H.264+AAC 코덱을 우선 선택해 파워포인트에 바로 삽입 가능
 - **완전 독립 exe**: ffmpeg 내장, 아무것도 설치할 필요 없음
 - **자동 업데이트**: 다운로드 실패 시(유튜브 변경 등) 깃허브 릴리즈의 새 exe로 자동 교체
-- **로그인 쿠키 재시도**: 연령 제한·403 등 비로그인 차단 영상은 브라우저(크롬/엣지/파이어폭스) 로그인 정보로 자동 재시도
+- **로그인 쿠키 재시도**: 연령 제한·403 등 비로그인 차단 영상은 브라우저(크롬/엣지/파이어폭스) 로그인 정보로 자동 재시도, 그래도 안 되면 유튜브의 모든 재생 클라이언트를 순서대로 시도
+
+## 그래도 안 받아지는 영상이 있으면 (cookies.txt)
+
+최신 크롬/엣지는 보안 강화로 외부 프로그램의 쿠키 읽기를 막는 경우가 있다. 이때는:
+
+1. 크롬 확장 [Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc) 설치
+2. youtube.com에 로그인한 상태에서 확장 아이콘 → Export → `cookies.txt` 저장
+3. 그 파일을 `YoutubeMP4.exe`와 **같은 폴더**에 두기
+
+파일이 있으면 앱이 항상 그 쿠키로 인증한다 (자동 재시도보다 우선).
 
 ## exe (권장)
 

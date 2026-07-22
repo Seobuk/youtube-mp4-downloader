@@ -67,6 +67,11 @@ def build_format(height=None):
             f"best{h}[ext=mp4]/best{h}/best")
 
 
+def exe_dir():
+    """exe(또는 스크립트)가 있는 폴더 — cookies.txt를 찾는 위치."""
+    return Path(sys.executable if getattr(sys, "frozen", False) else __file__).parent
+
+
 def needs_login_retry(err):
     """유튜브가 비로그인/자동화 클라이언트만 막을 때의 오류인지 (브라우저 쿠키로 재시도 가치)."""
     e = str(err).lower()
@@ -74,12 +79,15 @@ def needs_login_retry(err):
                                 "sign in", "age", "private video", "bot"))
 
 
-def download(url, out_dir, report, height=None, playlist=None, cookies_from=None):
+def download(url, out_dir, report, height=None, playlist=None, cookies_from=None,
+             alt_clients=False):
     """url을 out_dir에 mp4로 저장. report(pct, msg)로 진행 상황 통지.
     height를 주면 그 해상도 이하 중 최선으로 (용량 조절용).
     재생목록이면 재생목록 제목 폴더를 만들어 전체 다운로드.
     playlist=None이면 URL 형태로 자동 판별, True/False로 강제 지정 가능.
-    cookies_from에 브라우저 이름을 주면 그 브라우저의 로그인 쿠키로 인증."""
+    cookies_from에 브라우저 이름을 주면 그 브라우저의 로그인 쿠키로 인증.
+    (exe 옆에 cookies.txt가 있으면 그것을 최우선으로 사용.)
+    alt_clients=True면 유튜브의 모든 재생 클라이언트를 순서대로 시도."""
     if playlist is None:
         playlist = is_playlist(url)
     name = ("%(playlist_title)s/%(playlist_index)02d %(title)s.%(ext)s"
@@ -96,7 +104,13 @@ def download(url, out_dir, report, height=None, playlist=None, cookies_from=None
         "no_warnings": True,
         "ffmpeg_location": find_ffmpeg(),
     }
-    if cookies_from:
+    if alt_clients:
+        # 기본 클라이언트에서 'not available'인 영상도 다른 클라이언트엔 있을 수 있음
+        opts["extractor_args"] = {"youtube": {"player_client": ["all"]}}
+    cookie_txt = exe_dir() / "cookies.txt"
+    if cookie_txt.is_file():
+        opts["cookiefile"] = str(cookie_txt)  # 수동 쿠키 파일이 항상 최우선
+    elif cookies_from:
         opts["cookiesfrombrowser"] = (cookies_from,)
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -307,14 +321,26 @@ def run_gui(exec_=True):
                 # 유튜브가 비로그인 클라이언트만 막는 오류(연령 제한, 403 등)면
                 # 설치된 브라우저의 로그인 쿠키를 빌려 재시도
                 if needs_login_retry(first_err):
+                    good_browser = None
                     for browser in ("chrome", "edge", "firefox"):
                         try:
                             report(0, f"{browser} 로그인 정보로 재시도 중...")
                             download(url, out_dir, report, height, playlist,
                                      cookies_from=browser)
                             return
-                        except Exception:
-                            continue
+                        except Exception as e2:
+                            if "cookie" not in str(e2).lower():
+                                # 쿠키는 읽었는데도 차단 → 다른 브라우저도 같은 계정,
+                                # 대신 다른 재생 클라이언트를 시도할 가치가 있음
+                                good_browser = browser
+                                break
+                    try:
+                        report(0, "다른 재생 클라이언트로 재시도 중... (시간이 걸릴 수 있음)")
+                        download(url, out_dir, report, height, playlist,
+                                 cookies_from=good_browser, alt_clients=True)
+                        return
+                    except Exception:
+                        pass
                 # exe에서 실패하면 yt-dlp가 낡았을 수 있음 → 새 릴리즈 있으면 자동 교체
                 if getattr(sys, "frozen", False):
                     try:
@@ -413,6 +439,23 @@ def _selfcheck():
         captured.clear()
         download("https://youtu.be/x", ".", lambda p, m: None)
         assert "cookiesfrombrowser" not in captured
+        # alt_clients=True면 모든 재생 클라이언트 시도 옵션이 켜져야 함
+        captured.clear()
+        download("https://youtu.be/x", ".", lambda p, m: None, alt_clients=True)
+        assert captured["extractor_args"] == {"youtube": {"player_client": ["all"]}}
+        # exe 옆 cookies.txt가 있으면 브라우저 쿠키보다 우선
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "cookies.txt").write_text("# Netscape HTTP Cookie File\n")
+            g = globals()
+            orig_exe_dir = g["exe_dir"]
+            g["exe_dir"] = lambda: Path(td)
+            try:
+                captured.clear()
+                download("https://youtu.be/x", ".", lambda p, m: None, cookies_from="edge")
+                assert captured["cookiefile"].endswith("cookies.txt"), captured
+                assert "cookiesfrombrowser" not in captured
+            finally:
+                g["exe_dir"] = orig_exe_dir
     finally:
         yt_dlp.YoutubeDL = orig_ydl
     # 재생목록 판별: /playlist 링크만 전체 다운로드, watch+list는 영상 1개
