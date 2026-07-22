@@ -44,10 +44,14 @@ def download(url, out_dir, report):
 
 def update_ytdlp(report):
     """pip로 yt-dlp 최신화. 완료 후 앱 재시작 필요."""
+    if getattr(sys, "frozen", False):
+        # exe에서는 sys.executable이 이 앱 자신 → pip 대신 앱이 무한 재실행됨
+        report(0, "exe 버전은 자체 업데이트 불가 — Releases에서 새 exe를 받아 교체하세요")
+        return
     report(0, "yt-dlp 업데이트 중... (잠시 기다리세요)")
     r = subprocess.run(
         [sys.executable, "-m", "pip", "install", "-U", "yt-dlp"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, timeout=300,
     )
     if r.returncode == 0:
         report(100, "업데이트 완료 — 앱을 다시 실행하세요")
@@ -173,6 +177,14 @@ def _selfcheck():
     assert p == 0
     p, m = format_status({"status": "finished"})
     assert p == 100 and "병합" in m
+    # exe(frozen)에서는 pip를 실행하지 않고 안내만 해야 함
+    msgs = []
+    sys.frozen = True
+    try:
+        update_ytdlp(lambda pct, msg: msgs.append(msg))
+    finally:
+        del sys.frozen
+    assert msgs == ["exe 버전은 자체 업데이트 불가 — Releases에서 새 exe를 받아 교체하세요"], msgs
     print("selfcheck ok")
 
 
