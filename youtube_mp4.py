@@ -32,6 +32,21 @@ def format_status(d):
     return 0, d["status"]
 
 
+def is_playlist(url):
+    """재생목록 전체 다운로드 대상인지. watch?v=...&list=... 링크는 영상 1개로 취급."""
+    return "/playlist" in url
+
+
+def hook_status(d):
+    """진행률 훅 -> (전체 퍼센트, 메시지). 재생목록이면 [n/M]과 전체 진행도로 환산."""
+    pct, msg = format_status(d)
+    info = d.get("info_dict") or {}
+    idx, total = info.get("playlist_index"), info.get("n_entries")
+    if idx and total:
+        return ((idx - 1) + pct / 100) / total * 100, f"[{idx}/{total}] {msg}"
+    return pct, msg
+
+
 def find_ffmpeg():
     """exe에 번들된 ffmpeg 우선, 없으면 PATH에서 탐색. 없으면 None."""
     if getattr(sys, "frozen", False):
@@ -53,13 +68,18 @@ def build_format(height=None):
 
 def download(url, out_dir, report, height=None):
     """url을 out_dir에 mp4로 저장. report(pct, msg)로 진행 상황 통지.
-    height를 주면 그 해상도 이하 중 최선으로 다운로드 (용량 조절용)."""
+    height를 주면 그 해상도 이하 중 최선으로 (용량 조절용).
+    재생목록 링크면 재생목록 제목 폴더를 만들어 전체 다운로드."""
+    playlist = is_playlist(url)
+    name = ("%(playlist_title)s/%(playlist_index)02d %(title)s.%(ext)s"
+            if playlist else "%(title)s.%(ext)s")
     opts = {
         "format": build_format(height),
         "merge_output_format": "mp4",
-        "outtmpl": str(Path(out_dir) / "%(title)s.%(ext)s"),
-        "progress_hooks": [lambda d: report(*format_status(d))],
-        "noplaylist": True,  # 재생목록 링크여도 영상 1개만
+        "outtmpl": str(Path(out_dir) / name),
+        "progress_hooks": [lambda d: report(*hook_status(d))],
+        "noplaylist": not playlist,
+        "ignoreerrors": playlist,  # 재생목록 중 막힌 영상(비공개 등)은 건너뛰고 계속
         "quiet": True,
         "noprogress": True,  # 진행률은 progress_hooks로만 (windowed exe엔 콘솔 없음)
         "no_warnings": True,
@@ -67,7 +87,11 @@ def download(url, out_dir, report, height=None):
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
-    report(100, f"완료: {info.get('title', '')}.mp4")
+    if playlist:
+        done = [e for e in info.get("entries") or [] if e]
+        report(100, f"완료: 재생목록 '{info.get('title', '')}' 영상 {len(done)}개")
+    else:
+        report(100, f"완료: {info.get('title', '')}.mp4")
 
 
 def update_ytdlp(report):
@@ -168,7 +192,7 @@ def run_gui(exec_=True):
             self.setFixedWidth(520)
             self._last_pct = -1
 
-            self.url = QLineEdit(placeholderText="https://youtu.be/...")
+            self.url = QLineEdit(placeholderText="https://youtu.be/... 또는 재생목록 링크")
             self.dir = QLineEdit(str(Path.home() / "Downloads"))
             pick = QPushButton("폴더", clicked=self.pick_dir)
             self.quality = QComboBox()
@@ -273,7 +297,7 @@ def run_gui(exec_=True):
         def _report(self, pct, msg):
             # 다운로드 진행 틱을 1% 단위로 스로틀 (시그널 폭주 방지)
             ip = int(pct)
-            if msg.startswith("다운로드 중") and ip == self._last_pct:
+            if "다운로드 중" in msg and ip == self._last_pct:
                 return
             self._last_pct = ip
             self.status_signal.emit(pct, msg)
@@ -300,6 +324,18 @@ def _selfcheck():
     assert p == 0
     p, m = format_status({"status": "finished"})
     assert p == 100 and "병합" in m
+    # 재생목록 판별: /playlist 링크만 전체 다운로드, watch+list는 영상 1개
+    assert is_playlist("https://www.youtube.com/playlist?list=PLYU_yAU_QLzY")
+    assert not is_playlist("https://www.youtube.com/watch?v=abc&list=PLYU&index=3")
+    assert not is_playlist("https://youtu.be/abc")
+    # 재생목록 진행률: 10개 중 3번째가 50%면 전체 25%, [3/10] 표기
+    p, m = hook_status({"status": "downloading", "downloaded_bytes": 50,
+                        "total_bytes": 100, "speed": 2e6,
+                        "info_dict": {"playlist_index": 3, "n_entries": 10}})
+    assert p == 25 and m.startswith("[3/10] 다운로드 중"), (p, m)
+    p, m = hook_status({"status": "downloading", "downloaded_bytes": 50,
+                        "total_bytes": 100, "speed": 2e6})  # 단일 영상은 그대로
+    assert p == 50 and m.startswith("다운로드 중"), (p, m)
     # 포맷 문자열: H.264(avc1) 우선, 화질 상한 반영, 최후엔 무조건 best
     f = build_format()
     assert f.startswith("bestvideo[vcodec^=avc1]") and f.endswith("/best"), f
