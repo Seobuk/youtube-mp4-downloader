@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -66,11 +67,13 @@ def build_format(height=None):
             f"best{h}[ext=mp4]/best{h}/best")
 
 
-def download(url, out_dir, report, height=None):
+def download(url, out_dir, report, height=None, playlist=None):
     """url을 out_dir에 mp4로 저장. report(pct, msg)로 진행 상황 통지.
     height를 주면 그 해상도 이하 중 최선으로 (용량 조절용).
-    재생목록 링크면 재생목록 제목 폴더를 만들어 전체 다운로드."""
-    playlist = is_playlist(url)
+    재생목록이면 재생목록 제목 폴더를 만들어 전체 다운로드.
+    playlist=None이면 URL 형태로 자동 판별, True/False로 강제 지정 가능."""
+    if playlist is None:
+        playlist = is_playlist(url)
     name = ("%(playlist_title)s/%(playlist_index)02d %(title)s.%(ext)s"
             if playlist else "%(title)s.%(ext)s")
     opts = {
@@ -143,6 +146,20 @@ def cleanup_old_exe():
 
 def update_app(report, skip_same=False):
     """깃허브 최신 릴리즈 exe로 자기 자신을 교체. 교체했으면 True (앱 재시작 필요)."""
+    try:
+        return _update_app(report, skip_same)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            # 비공개 저장소는 조회/다운로드 어느 단계든 익명 접근이 404
+            report(0, "릴리즈 접근 실패(404) — 깃허브 저장소가 비공개면 공개로 전환해야 합니다")
+            return False
+        raise
+
+
+def _update_app(report, skip_same):
+    if not getattr(sys, "frozen", False):
+        report(0, "자동 업데이트는 exe 버전에서만 동작합니다")
+        return False
     report(0, "새 버전 확인 중...")
     tag, asset = latest_release()
     if tag == APP_VERSION:
@@ -175,7 +192,7 @@ def run_gui(exec_=True):
     from PyQt6.QtCore import pyqtSignal
     from PyQt6.QtWidgets import (
         QApplication, QComboBox, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
-        QProgressBar, QPushButton, QVBoxLayout, QWidget,
+        QMessageBox, QProgressBar, QPushButton, QVBoxLayout, QWidget,
     )
 
     cleanup_old_exe()
@@ -242,18 +259,38 @@ def run_gui(exec_=True):
             if d:
                 self.dir.setText(d)
 
+        def _ask_playlist_scope(self):
+            """영상 링크에 재생목록이 붙어 있을 때: True=전체, False=이 영상만, None=취소."""
+            box = QMessageBox(self)
+            box.setWindowTitle("재생목록 감지")
+            box.setText("이 영상은 재생목록에 포함되어 있습니다.\n어떻게 받을까요?")
+            one = box.addButton("이 영상만", QMessageBox.ButtonRole.NoRole)
+            all_ = box.addButton("재생목록 전체", QMessageBox.ButtonRole.YesRole)
+            box.addButton("취소", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            if box.clickedButton() is one:
+                return False
+            if box.clickedButton() is all_:
+                return True
+            return None
+
         def start_download(self):
             url = self.url.text().strip()
             if not url:
                 return self._on_status(0, "링크를 입력하세요")
             if not find_ffmpeg():
                 return self._on_status(0, "ffmpeg가 없습니다 (병합 불가)")
+            playlist = None  # URL 형태로 자동 판별
+            if "list=" in url and not is_playlist(url):
+                playlist = self._ask_playlist_scope()
+                if playlist is None:
+                    return  # 취소
             out_dir = self.dir.text()
             height = self.quality.currentData()
 
             def work(report):
                 try:
-                    download(url, out_dir, report, height)
+                    download(url, out_dir, report, height, playlist)
                 except Exception as e:  # 네트워크/포맷 오류를 GUI에 그대로 표시
                     # exe에서 실패하면 yt-dlp가 낡았을 수 있음 → 새 릴리즈 있으면 자동 교체
                     if getattr(sys, "frozen", False):
