@@ -353,9 +353,13 @@ def run_gui(exec_=True):
                 if attempt(None):
                     return
                 first_err = errors[0][1]
-                # 유튜브가 비로그인 클라이언트만 막는 오류(연령 제한, 403 등)면
-                # 브라우저 로그인 쿠키 → 다른 재생 클라이언트 순으로 재시도
+                # 유튜브가 비로그인 클라이언트만 막는 오류(연령 제한, 403 등)면 재시도.
+                # 'not available'류는 로그인 문제가 아닌 경우가 대부분이라
+                # 빠른 전체 클라이언트 시도를 먼저, 브라우저 쿠키는 그다음.
                 if needs_login_retry(first_err):
+                    if attempt("다른 재생 클라이언트로 재시도 중... (시간이 걸릴 수 있음)",
+                               alt_clients=True):
+                        return
                     good_browser = None
                     for browser in ("chrome", "edge", "firefox"):
                         if attempt(f"{browser} 로그인 정보로 재시도 중...",
@@ -366,12 +370,8 @@ def run_gui(exec_=True):
                             good_browser = browser
                             break
                     if good_browser and attempt(
-                            "다른 재생 클라이언트로 재시도 중... (시간이 걸릴 수 있음)",
+                            "쿠키 + 전체 클라이언트로 재시도 중...",
                             cookies_from=good_browser, alt_clients=True):
-                        return
-                    # 쿠키 없이도 전체 클라이언트 시도 (쿠키 오류에 발목 잡히지 않게)
-                    if attempt("다른 재생 클라이언트로 재시도 중... (로그인 없이)",
-                               alt_clients=True):
                         return
                 write_debug_log(url, errors)  # 진단용: 시도 내역을 YoutubeMP4.log에
                 # exe에서 실패하면 yt-dlp가 낡았을 수 있음 → 새 릴리즈 있으면 자동 교체
