@@ -60,11 +60,14 @@ def find_ffmpeg():
 
 def build_format(height=None):
     """화질 상한에 맞는 yt-dlp 포맷 문자열.
-    H.264(avc1)+AAC 우선 — 파워포인트 등에서 충돌 없이 재생되는 코덱 조합."""
+    H.264(avc1)+AAC 우선 — 파워포인트 등에서 충돌 없이 재생되는 코덱 조합.
+    그런 조합이 없는 영상(분리 스트림만, m4a 오디오 없음 등)도 받도록 단계적 폴백."""
     h = f"[height<={height}]" if height else ""
     return (f"bestvideo{h}[vcodec^=avc1]+bestaudio[ext=m4a]/"
             f"bestvideo{h}[ext=mp4]+bestaudio[ext=m4a]/"
-            f"best{h}[ext=mp4]/best{h}/best")
+            f"bestvideo{h}+bestaudio/"
+            f"best{h}[ext=mp4]/best{h}/"
+            "bestvideo+bestaudio/best")
 
 
 def exe_dir():
@@ -73,10 +76,32 @@ def exe_dir():
 
 
 def needs_login_retry(err):
-    """유튜브가 비로그인/자동화 클라이언트만 막을 때의 오류인지 (브라우저 쿠키로 재시도 가치)."""
+    """쿠키 인증이나 다른 재생 클라이언트로 재시도할 가치가 있는 오류인지.
+    (비로그인 차단, 그리고 현재 클라이언트에 맞는 포맷이 없는 경우 포함)"""
     e = str(err).lower()
     return any(k in e for k in ("not available", "403", "forbidden",
-                                "sign in", "age", "private video", "bot"))
+                                "sign in", "age", "private video", "bot",
+                                "requested format"))
+
+
+def is_cookie_error(err):
+    """브라우저 쿠키를 읽는 단계 자체가 실패한 오류인지 (영상 차단과 구분)."""
+    e = str(err).lower()
+    return any(k in e for k in ("cookie", "decrypt", "dpapi", "keyring"))
+
+
+def write_debug_log(url, errors):
+    """실패한 시도 내역을 exe 옆 YoutubeMP4.log에 기록 (안 되면 홈 폴더에). 진단용."""
+    from datetime import datetime
+    for base in (exe_dir(), Path.home()):
+        try:
+            with open(base / "YoutubeMP4.log", "a", encoding="utf-8") as f:
+                f.write(f"\n[{datetime.now():%Y-%m-%d %H:%M:%S}] {APP_VERSION} {url}\n")
+                for label, err in errors:
+                    f.write(f"  - {label}: {err}\n")
+            return
+        except OSError:
+            continue
 
 
 def download(url, out_dir, report, height=None, playlist=None, cookies_from=None,
@@ -313,34 +338,42 @@ def run_gui(exec_=True):
             height = self.quality.currentData()
 
             def work(report):
-                try:
-                    download(url, out_dir, report, height, playlist)
+                errors = []
+
+                def attempt(label, **kw):
+                    if label:
+                        report(0, label)
+                    try:
+                        download(url, out_dir, report, height, playlist, **kw)
+                        return True
+                    except Exception as e:
+                        errors.append((label or "기본 시도", str(e)))
+                        return False
+
+                if attempt(None):
                     return
-                except Exception as e:  # 네트워크/포맷 오류를 GUI에 그대로 표시
-                    first_err = e
+                first_err = errors[0][1]
                 # 유튜브가 비로그인 클라이언트만 막는 오류(연령 제한, 403 등)면
-                # 설치된 브라우저의 로그인 쿠키를 빌려 재시도
+                # 브라우저 로그인 쿠키 → 다른 재생 클라이언트 순으로 재시도
                 if needs_login_retry(first_err):
                     good_browser = None
                     for browser in ("chrome", "edge", "firefox"):
-                        try:
-                            report(0, f"{browser} 로그인 정보로 재시도 중...")
-                            download(url, out_dir, report, height, playlist,
-                                     cookies_from=browser)
+                        if attempt(f"{browser} 로그인 정보로 재시도 중...",
+                                   cookies_from=browser):
                             return
-                        except Exception as e2:
-                            if "cookie" not in str(e2).lower():
-                                # 쿠키는 읽었는데도 차단 → 다른 브라우저도 같은 계정,
-                                # 대신 다른 재생 클라이언트를 시도할 가치가 있음
-                                good_browser = browser
-                                break
-                    try:
-                        report(0, "다른 재생 클라이언트로 재시도 중... (시간이 걸릴 수 있음)")
-                        download(url, out_dir, report, height, playlist,
-                                 cookies_from=good_browser, alt_clients=True)
+                        if not is_cookie_error(errors[-1][1]):
+                            # 쿠키는 읽었는데도 차단 → 다른 브라우저도 같은 계정
+                            good_browser = browser
+                            break
+                    if good_browser and attempt(
+                            "다른 재생 클라이언트로 재시도 중... (시간이 걸릴 수 있음)",
+                            cookies_from=good_browser, alt_clients=True):
                         return
-                    except Exception:
-                        pass
+                    # 쿠키 없이도 전체 클라이언트 시도 (쿠키 오류에 발목 잡히지 않게)
+                    if attempt("다른 재생 클라이언트로 재시도 중... (로그인 없이)",
+                               alt_clients=True):
+                        return
+                write_debug_log(url, errors)  # 진단용: 시도 내역을 YoutubeMP4.log에
                 # exe에서 실패하면 yt-dlp가 낡았을 수 있음 → 새 릴리즈 있으면 자동 교체
                 if getattr(sys, "frozen", False):
                     try:
@@ -414,7 +447,12 @@ def _selfcheck():
     assert needs_login_retry("ERROR: [youtube] q1DinydBRNE: This video is not available")
     assert needs_login_retry("ERROR: unable to download video data: HTTP Error 403: Forbidden")
     assert needs_login_retry("Sign in to confirm your age")
+    assert needs_login_retry("Requested format is not available. Use --list-formats")
     assert not needs_login_retry("HTTP Error 404: Not Found")
+    # 쿠키 읽기 실패 판별 (영상 차단과 구분): 크롬 암호화 오류들 포함
+    assert is_cookie_error("could not find chrome cookies database")
+    assert is_cookie_error("Failed to decrypt with DPAPI")
+    assert not is_cookie_error("This video is not available")
     # cookies_from 지정 시 yt-dlp 옵션에 반영되는지 (가짜 YoutubeDL로 캡처)
     captured = {}
 
@@ -470,11 +508,14 @@ def _selfcheck():
     p, m = hook_status({"status": "downloading", "downloaded_bytes": 50,
                         "total_bytes": 100, "speed": 2e6})  # 단일 영상은 그대로
     assert p == 50 and m.startswith("다운로드 중"), (p, m)
-    # 포맷 문자열: H.264(avc1) 우선, 화질 상한 반영, 최후엔 무조건 best
+    # 포맷 문자열: H.264(avc1) 우선, 화질 상한 반영, 코덱 불문 병합 폴백, 최후엔 무조건 best
     f = build_format()
     assert f.startswith("bestvideo[vcodec^=avc1]") and f.endswith("/best"), f
+    assert "bestvideo+bestaudio/" in f, f
     f = build_format(720)
     assert "bestvideo[height<=720][vcodec^=avc1]" in f and "best[height<=720]/" in f, f
+    assert "bestvideo[height<=720]+bestaudio/" in f, f
+    assert f.endswith("bestvideo+bestaudio/best"), f  # 최후 폴백은 화질 제한도 해제
     # exe(frozen)에서는 pip를 실행하지 않고 안내만 해야 함
     msgs = []
     sys.frozen = True
