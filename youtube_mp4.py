@@ -1,7 +1,8 @@
 """유튜브 링크 -> MP4 다운로드 GUI (PyQt6). yt-dlp + ffmpeg 래퍼.
 
-exe(PyInstaller) 배포: ffmpeg 내장, 다운로드 실패 시 깃허브 릴리즈에서 자동 업데이트.
-소스 실행: pip install yt-dlp PyQt6  →  python youtube_mp4.py (ffmpeg는 PATH에)
+exe(PyInstaller) 배포: ffmpeg·deno 내장, 다운로드 실패 시 깃허브 릴리즈에서 자동 업데이트.
+소스 실행: pip install -r requirements.txt  →  python youtube_mp4.py
+(ffmpeg는 PATH에. deno가 PATH에 있으면 전체 화질, 없으면 유튜브가 360p로 제한될 수 있음)
 """
 import json
 import os
@@ -48,14 +49,14 @@ def hook_status(d):
     return pct, msg
 
 
-def find_ffmpeg():
-    """exe에 번들된 ffmpeg 우선, 없으면 PATH에서 탐색. 없으면 None."""
+def find_tool(name):
+    """exe에 번들된 실행 파일(ffmpeg/deno) 우선, 없으면 PATH에서 탐색. 없으면 None."""
     if getattr(sys, "frozen", False):
         bundled = Path(getattr(sys, "_MEIPASS", "")) / (
-            "ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+            f"{name}.exe" if os.name == "nt" else name)
         if bundled.is_file():
             return str(bundled)
-    return shutil.which("ffmpeg")
+    return shutil.which(name)
 
 
 def build_format(height=None):
@@ -127,8 +128,13 @@ def download(url, out_dir, report, height=None, playlist=None, cookies_from=None
         "quiet": True,
         "noprogress": True,  # 진행률은 progress_hooks로만 (windowed exe엔 콘솔 없음)
         "no_warnings": True,
-        "ffmpeg_location": find_ffmpeg(),
+        "ffmpeg_location": find_tool("ffmpeg"),
     }
+    deno = find_tool("deno")
+    if deno:
+        # 최신 유튜브는 JS 챌린지(EJS)를 풀어야 전체 화질 포맷을 줌 — deno로 해결.
+        # 없으면 yt-dlp가 360p 폴백이나 '포맷 없음'으로 떨어짐.
+        opts["js_runtimes"] = {"deno": {"path": deno}}
     if alt_clients:
         # 기본 클라이언트에서 'not available'인 영상도 다른 클라이언트엔 있을 수 있음
         opts["extractor_args"] = {"youtube": {"player_client": ["all"]}}
@@ -327,7 +333,7 @@ def run_gui(exec_=True):
             url = self.url.text().strip()
             if not url:
                 return self._on_status(0, "링크를 입력하세요")
-            if not find_ffmpeg():
+            if not find_tool("ffmpeg"):
                 return self._on_status(0, "ffmpeg가 없습니다 (병합 불가)")
             playlist = None  # URL 형태로 자동 판별
             if "list=" in url and not is_playlist(url):
@@ -477,6 +483,22 @@ def _selfcheck():
         captured.clear()
         download("https://youtu.be/x", ".", lambda p, m: None)
         assert "cookiesfrombrowser" not in captured
+        # deno가 있으면 js_runtimes로 전달 (전체 화질 포맷의 핵심), 없으면 미설정
+        orig_which = shutil.which
+        shutil.which = lambda n: r"C:\x\deno.exe" if n == "deno" else orig_which(n)
+        try:
+            captured.clear()
+            download("https://youtu.be/x", ".", lambda p, m: None)
+            assert captured["js_runtimes"] == {"deno": {"path": r"C:\x\deno.exe"}}, captured
+        finally:
+            shutil.which = orig_which
+        shutil.which = lambda n: None if n == "deno" else orig_which(n)
+        try:
+            captured.clear()
+            download("https://youtu.be/x", ".", lambda p, m: None)
+            assert "js_runtimes" not in captured
+        finally:
+            shutil.which = orig_which
         # alt_clients=True면 모든 재생 클라이언트 시도 옵션이 켜져야 함
         captured.clear()
         download("https://youtu.be/x", ".", lambda p, m: None, alt_clients=True)
@@ -524,15 +546,16 @@ def _selfcheck():
     finally:
         del sys.frozen
     assert msgs == ["exe 버전은 pip 업데이트 불가 — 업데이트 확인 버튼을 사용하세요"], msgs
-    # frozen + _MEIPASS에 ffmpeg가 있으면 PATH보다 번들을 우선해야 함
+    # frozen + _MEIPASS에 번들 실행 파일이 있으면 PATH보다 번들을 우선해야 함
     with tempfile.TemporaryDirectory() as td:
-        bundled = Path(td) / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
-        bundled.touch()
-        sys.frozen, sys._MEIPASS = True, td
-        try:
-            assert find_ffmpeg() == str(bundled)
-        finally:
-            del sys.frozen, sys._MEIPASS
+        for tool in ("ffmpeg", "deno"):
+            bundled = Path(td) / (f"{tool}.exe" if os.name == "nt" else tool)
+            bundled.touch()
+            sys.frozen, sys._MEIPASS = True, td
+            try:
+                assert find_tool(tool) == str(bundled)
+            finally:
+                del sys.frozen, sys._MEIPASS
     # swap_exe: 새 파일로 교체, 기존은 .old로 보관
     with tempfile.TemporaryDirectory() as td:
         exe, new = Path(td) / "app.exe", Path(td) / "app.new.exe"
