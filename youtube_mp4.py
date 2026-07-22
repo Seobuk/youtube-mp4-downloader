@@ -1,14 +1,22 @@
 """유튜브 링크 -> MP4 다운로드 GUI (PyQt6). yt-dlp + ffmpeg 래퍼.
 
-실행: pip install yt-dlp PyQt6  →  python youtube_mp4.py
+exe(PyInstaller) 배포: ffmpeg 내장, 다운로드 실패 시 깃허브 릴리즈에서 자동 업데이트.
+소스 실행: pip install yt-dlp PyQt6  →  python youtube_mp4.py (ffmpeg는 PATH에)
 """
+import json
+import os
 import shutil
 import subprocess
 import sys
 import threading
+import urllib.request
 from pathlib import Path
 
 import yt_dlp
+
+GITHUB_REPO = "Seobuk/youtube-mp4-downloader"
+APP_VERSION = "dev"  # 릴리즈 빌드 시 워크플로우가 태그로 치환
+EXE_NAME = "YoutubeMP4.exe"
 
 
 def format_status(d):
@@ -24,11 +32,30 @@ def format_status(d):
     return 0, d["status"]
 
 
-def download(url, out_dir, report):
-    """url을 out_dir에 mp4로 저장. report(pct, msg)로 진행 상황 통지."""
+def find_ffmpeg():
+    """exe에 번들된 ffmpeg 우선, 없으면 PATH에서 탐색. 없으면 None."""
+    if getattr(sys, "frozen", False):
+        bundled = Path(getattr(sys, "_MEIPASS", "")) / (
+            "ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+        if bundled.is_file():
+            return str(bundled)
+    return shutil.which("ffmpeg")
+
+
+def build_format(height=None):
+    """화질 상한에 맞는 yt-dlp 포맷 문자열.
+    H.264(avc1)+AAC 우선 — 파워포인트 등에서 충돌 없이 재생되는 코덱 조합."""
+    h = f"[height<={height}]" if height else ""
+    return (f"bestvideo{h}[vcodec^=avc1]+bestaudio[ext=m4a]/"
+            f"bestvideo{h}[ext=mp4]+bestaudio[ext=m4a]/"
+            f"best{h}[ext=mp4]/best{h}/best")
+
+
+def download(url, out_dir, report, height=None):
+    """url을 out_dir에 mp4로 저장. report(pct, msg)로 진행 상황 통지.
+    height를 주면 그 해상도 이하 중 최선으로 다운로드 (용량 조절용)."""
     opts = {
-        # bestvideo+bestaudio mp4 우선, 없으면 최선의 단일 mp4, 그것도 없으면 아무거나
-        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "format": build_format(height),
         "merge_output_format": "mp4",
         "outtmpl": str(Path(out_dir) / "%(title)s.%(ext)s"),
         "progress_hooks": [lambda d: report(*format_status(d))],
@@ -36,6 +63,7 @@ def download(url, out_dir, report):
         "quiet": True,
         "noprogress": True,  # 진행률은 progress_hooks로만 (windowed exe엔 콘솔 없음)
         "no_warnings": True,
+        "ffmpeg_location": find_ffmpeg(),
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -43,10 +71,10 @@ def download(url, out_dir, report):
 
 
 def update_ytdlp(report):
-    """pip로 yt-dlp 최신화. 완료 후 앱 재시작 필요."""
+    """(소스 실행 전용) pip로 yt-dlp 최신화. 완료 후 앱 재시작 필요."""
     if getattr(sys, "frozen", False):
         # exe에서는 sys.executable이 이 앱 자신 → pip 대신 앱이 무한 재실행됨
-        report(0, "exe 버전은 자체 업데이트 불가 — Releases에서 새 exe를 받아 교체하세요")
+        report(0, "exe 버전은 pip 업데이트 불가 — 업데이트 확인 버튼을 사용하세요")
         return
     report(0, "yt-dlp 업데이트 중... (잠시 기다리세요)")
     r = subprocess.run(
@@ -60,18 +88,79 @@ def update_ytdlp(report):
         report(0, f"업데이트 실패: {tail[-1] if tail else '알 수 없는 오류'}")
 
 
+def latest_release():
+    """깃허브 최신 릴리즈 조회 -> (태그, exe 에셋 dict | None)."""
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+        headers={"User-Agent": EXE_NAME})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        rel = json.load(r)
+    asset = next((a for a in rel.get("assets", []) if a["name"] == EXE_NAME), None)
+    return rel.get("tag_name", ""), asset
+
+
+def swap_exe(exe, new):
+    """실행 중인 exe를 new로 교체. 기존 파일은 .old로 보관 (다음 실행 때 정리)."""
+    old = exe.with_name(exe.stem + ".old.exe")
+    old.unlink(missing_ok=True)
+    exe.rename(old)  # 윈도우도 실행 중인 exe의 rename은 허용됨
+    new.rename(exe)
+
+
+def cleanup_old_exe():
+    """이전 자동 업데이트가 남긴 .old 파일 삭제 (아직 실행 중이면 다음 기회에)."""
+    if getattr(sys, "frozen", False):
+        exe = Path(sys.executable)
+        try:
+            exe.with_name(exe.stem + ".old.exe").unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def update_app(report, skip_same=False):
+    """깃허브 최신 릴리즈 exe로 자기 자신을 교체. 교체했으면 True (앱 재시작 필요)."""
+    report(0, "새 버전 확인 중...")
+    tag, asset = latest_release()
+    if tag == APP_VERSION:
+        if not skip_same:
+            report(100, f"이미 최신 버전입니다 ({APP_VERSION})")
+        return False
+    if not asset:
+        report(0, f"릴리즈 {tag}에 {EXE_NAME}가 없습니다")
+        return False
+    exe = Path(sys.executable)
+    new = exe.with_name(exe.stem + ".new.exe")
+    req = urllib.request.Request(asset["browser_download_url"],
+                                 headers={"User-Agent": EXE_NAME})
+    total = asset.get("size") or 0
+    done = 0
+    with urllib.request.urlopen(req, timeout=60) as r, open(new, "wb") as f:
+        while chunk := r.read(1 << 18):
+            f.write(chunk)
+            done += len(chunk)
+            pct = done / total * 100 if total else 0
+            report(pct, f"{tag} 받는 중... {pct:3.0f}%")
+    swap_exe(exe, new)
+    subprocess.Popen([str(exe)])
+    report(100, f"{tag} 교체 완료 — 새 창이 열립니다")
+    return True
+
+
 def run_gui(exec_=True):
     """GUI 실행. exec_=False면 이벤트 루프를 돌리지 않고 (app, win) 반환 (테스트용)."""
     from PyQt6.QtCore import pyqtSignal
     from PyQt6.QtWidgets import (
-        QApplication, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
+        QApplication, QComboBox, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
         QProgressBar, QPushButton, QVBoxLayout, QWidget,
     )
+
+    cleanup_old_exe()
 
     class MainWindow(QWidget):
         # 워커 스레드 -> UI 스레드 전달용 (Qt 시그널은 스레드 안전)
         status_signal = pyqtSignal(float, str)
         done_signal = pyqtSignal()
+        restart_signal = pyqtSignal()  # 자동 업데이트 후 앱 종료 (새 exe가 이미 실행됨)
 
         def __init__(self):
             super().__init__()
@@ -82,6 +171,10 @@ def run_gui(exec_=True):
             self.url = QLineEdit(placeholderText="https://youtu.be/...")
             self.dir = QLineEdit(str(Path.home() / "Downloads"))
             pick = QPushButton("폴더", clicked=self.pick_dir)
+            self.quality = QComboBox()
+            for label, h in [("최고 화질", None), ("1080p", 1080), ("720p", 720),
+                             ("480p", 480), ("360p", 360)]:
+                self.quality.addItem(label, h)
             self.go = QPushButton("MP4 다운로드", clicked=self.start_download)
             self.go.setStyleSheet(
                 "background:#e63946; color:#fff; font-weight:600;"
@@ -91,9 +184,11 @@ def run_gui(exec_=True):
             self.bar.setRange(0, 100)
             self.bar.setFixedHeight(8)
             self.status = QLabel("대기 중")
-            ver = QLabel(f"yt-dlp {yt_dlp.version.__version__}")
+            ver = QLabel(f"{APP_VERSION} · yt-dlp {yt_dlp.version.__version__}")
             ver.setStyleSheet("color:gray; font-size:11px;")
-            self.upd = QPushButton("yt-dlp 업데이트", clicked=self.start_update)
+            frozen = getattr(sys, "frozen", False)
+            self.upd = QPushButton("업데이트 확인" if frozen else "yt-dlp 업데이트",
+                                   clicked=self.start_update)
 
             root = QVBoxLayout(self)
             root.addWidget(QLabel("유튜브 링크"))
@@ -103,6 +198,8 @@ def run_gui(exec_=True):
             row.addWidget(self.dir)
             row.addWidget(pick)
             root.addLayout(row)
+            root.addWidget(QLabel("화질 (낮출수록 용량 작음 · mp4/H.264라 PPT 삽입 가능)"))
+            root.addWidget(self.quality)
             root.addWidget(self.go)
             root.addWidget(self.bar)
             root.addWidget(self.status)
@@ -114,6 +211,7 @@ def run_gui(exec_=True):
 
             self.status_signal.connect(self._on_status)
             self.done_signal.connect(lambda: self._busy(False))
+            self.restart_signal.connect(QApplication.instance().quit)
 
         def pick_dir(self):
             d = QFileDialog.getExistingDirectory(self, "저장 폴더 선택", self.dir.text())
@@ -124,26 +222,47 @@ def run_gui(exec_=True):
             url = self.url.text().strip()
             if not url:
                 return self._on_status(0, "링크를 입력하세요")
-            if not shutil.which("ffmpeg"):
+            if not find_ffmpeg():
                 return self._on_status(0, "ffmpeg가 없습니다 (병합 불가)")
             out_dir = self.dir.text()
-            self._run(lambda report: download(url, out_dir, report))
+            height = self.quality.currentData()
+
+            def work(report):
+                try:
+                    download(url, out_dir, report, height)
+                except Exception as e:  # 네트워크/포맷 오류를 GUI에 그대로 표시
+                    # exe에서 실패하면 yt-dlp가 낡았을 수 있음 → 새 릴리즈 있으면 자동 교체
+                    if getattr(sys, "frozen", False):
+                        try:
+                            report(0, f"오류: {e} — 새 버전 확인 중...")
+                            if update_app(report, skip_same=True):
+                                return True
+                        except Exception:
+                            pass  # 업데이트 확인 실패 시 원래 오류 표시
+                    report(0, f"오류: {e}")
+
+            self._run(work)
 
         def start_update(self):
-            self._run(update_ytdlp)
+            if getattr(sys, "frozen", False):
+                self._run(update_app)
+            else:
+                self._run(update_ytdlp)
 
         def _run(self, fn):
-            """fn(report)를 워커 스레드에서 실행. 완료까지 버튼 잠금."""
+            """fn(report)를 워커 스레드에서 실행. 완료까지 버튼 잠금.
+            fn이 참을 반환하면 앱 재시작 필요 (자동 업데이트로 교체됨)."""
             self._busy(True)
             self._last_pct = -1
 
             def work():
+                restart = False
                 try:
-                    fn(self._report)
-                except Exception as e:  # 네트워크/포맷 오류를 GUI에 그대로 표시
+                    restart = bool(fn(self._report))
+                except Exception as e:
                     self._report(0, f"오류: {e}")
                 finally:
-                    self.done_signal.emit()
+                    (self.restart_signal if restart else self.done_signal).emit()
 
             threading.Thread(target=work, daemon=True).start()
 
@@ -172,6 +291,8 @@ def run_gui(exec_=True):
 
 
 def _selfcheck():
+    import tempfile
+
     p, m = format_status({"status": "downloading", "downloaded_bytes": 50,
                           "total_bytes": 100, "speed": 2e6})
     assert p == 50 and "50.0%" in m, m
@@ -179,6 +300,11 @@ def _selfcheck():
     assert p == 0
     p, m = format_status({"status": "finished"})
     assert p == 100 and "병합" in m
+    # 포맷 문자열: H.264(avc1) 우선, 화질 상한 반영, 최후엔 무조건 best
+    f = build_format()
+    assert f.startswith("bestvideo[vcodec^=avc1]") and f.endswith("/best"), f
+    f = build_format(720)
+    assert "bestvideo[height<=720][vcodec^=avc1]" in f and "best[height<=720]/" in f, f
     # exe(frozen)에서는 pip를 실행하지 않고 안내만 해야 함
     msgs = []
     sys.frozen = True
@@ -186,7 +312,24 @@ def _selfcheck():
         update_ytdlp(lambda pct, msg: msgs.append(msg))
     finally:
         del sys.frozen
-    assert msgs == ["exe 버전은 자체 업데이트 불가 — Releases에서 새 exe를 받아 교체하세요"], msgs
+    assert msgs == ["exe 버전은 pip 업데이트 불가 — 업데이트 확인 버튼을 사용하세요"], msgs
+    # frozen + _MEIPASS에 ffmpeg가 있으면 PATH보다 번들을 우선해야 함
+    with tempfile.TemporaryDirectory() as td:
+        bundled = Path(td) / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+        bundled.touch()
+        sys.frozen, sys._MEIPASS = True, td
+        try:
+            assert find_ffmpeg() == str(bundled)
+        finally:
+            del sys.frozen, sys._MEIPASS
+    # swap_exe: 새 파일로 교체, 기존은 .old로 보관
+    with tempfile.TemporaryDirectory() as td:
+        exe, new = Path(td) / "app.exe", Path(td) / "app.new.exe"
+        exe.write_text("old"), new.write_text("new")
+        swap_exe(exe, new)
+        assert exe.read_text() == "new"
+        assert (Path(td) / "app.old.exe").read_text() == "old"
+        assert not new.exists()
     print("selfcheck ok")
 
 
