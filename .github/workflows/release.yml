@@ -20,10 +20,19 @@ jobs:
           python-version: "3.12"
       - name: Install dependencies
         run: pip install -r requirements.txt pyinstaller
+      - name: Stamp version (APP_VERSION을 릴리즈 태그로 치환)
+        shell: bash
+        run: sed -i 's/^APP_VERSION = .*/APP_VERSION = "${{ github.event.inputs.tag }}"/' youtube_mp4.py
       - name: Selfcheck
         run: python youtube_mp4.py --selfcheck
+      - name: Fetch ffmpeg (exe에 동봉)
+        run: |
+          curl -L -o ffmpeg.zip https://github.com/yt-dlp/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip
+          tar -xf ffmpeg.zip
+          copy ffmpeg-master-latest-win64-gpl\bin\ffmpeg.exe .
+        shell: cmd
       - name: Build exe
-        run: pyinstaller --onefile --windowed --name YoutubeMP4 youtube_mp4.py
+        run: pyinstaller --onefile --windowed --name YoutubeMP4 --add-binary "ffmpeg.exe;." youtube_mp4.py
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
@@ -31,11 +40,9 @@ jobs:
           name: YoutubeMP4 ${{ github.event.inputs.tag }}
           files: dist/YoutubeMP4.exe
           body: |
-            유튜브 → MP4 다운로더 (PyQt6 GUI).
+            유튜브 → MP4 다운로더 (PyQt6 GUI). **ffmpeg 내장 — 별도 설치 없이 exe 하나로 동작.**
 
             ## 사용법
             YoutubeMP4.exe 실행 → 링크 붙여넣기 → 저장 폴더 선택 → MP4 다운로드.
 
-            ## 필요
-            - **ffmpeg**가 PATH에 설치되어 있어야 함 (bestvideo+bestaudio 병합용).
-            - 유튜브 변경으로 다운로드가 막히면 Releases에서 새 exe를 받아 교체.
+            유튜브 변경으로 다운로드가 막히면 Releases에서 새 exe를 받아 교체.
