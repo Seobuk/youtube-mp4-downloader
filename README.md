@@ -1,6 +1,6 @@
 # 유튜브 → MP4 다운로더
 
-yt-dlp + ffmpeg 기반, HTML(pywebview) GUI. 유튜브 링크를 붙여넣고 버튼 한 번으로 MP4 저장.
+yt-dlp + ffmpeg 기반, PyQt6 GUI. 유튜브 링크를 붙여넣고 버튼 한 번으로 MP4 저장.
 
 ## 소스로 실행
 

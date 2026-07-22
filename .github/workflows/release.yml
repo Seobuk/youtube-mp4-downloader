@@ -1,0 +1,41 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "릴리즈 태그 (예: v1.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+      - name: Selfcheck
+        run: python youtube_mp4.py --selfcheck
+      - name: Build exe
+        run: pyinstaller --onefile --windowed --name YoutubeMP4 youtube_mp4.py
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag }}
+          name: YoutubeMP4 ${{ github.event.inputs.tag }}
+          files: dist/YoutubeMP4.exe
+          body: |
+            유튜브 → MP4 다운로더 (PyQt6 GUI).
+
+            ## 사용법
+            YoutubeMP4.exe 실행 → 링크 붙여넣기 → 저장 폴더 선택 → MP4 다운로드.
+
+            ## 필요
+            - **ffmpeg**가 PATH에 설치되어 있어야 함 (bestvideo+bestaudio 병합용).
+            - 유튜브 변경으로 다운로드가 막히면 Releases에서 새 exe를 받아 교체.
