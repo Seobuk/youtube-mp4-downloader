@@ -49,5 +49,37 @@ jobs:
 
             ## 사용법
             YoutubeMP4.exe 실행 → 링크 붙여넣기 → 저장 폴더 선택 → MP4 다운로드.
+            리눅스: `YoutubeMP4-linux` 다운로드 후 `chmod +x YoutubeMP4-linux`로 실행.
 
             유튜브 변경으로 다운로드가 막히면 Releases에서 새 exe를 받아 교체.
+
+  build-linux:
+    needs: build-and-release  # 릴리즈 생성 후 에셋만 추가 (동시 생성 충돌 방지)
+    runs-on: ubuntu-22.04  # 구형 glibc 호환 위해 latest 대신 22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+      - name: Stamp version (APP_VERSION을 릴리즈 태그로 치환)
+        run: sed -i 's/^APP_VERSION = .*/APP_VERSION = "${{ github.event.inputs.tag }}"/' youtube_mp4.py
+      - name: Selfcheck
+        run: python youtube_mp4.py --selfcheck
+      - name: Fetch ffmpeg (바이너리에 동봉)
+        run: |
+          curl -L -o ffmpeg.tar.xz https://github.com/yt-dlp/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-linux64-gpl.tar.xz
+          tar -xf ffmpeg.tar.xz
+          cp ffmpeg-master-latest-linux64-gpl/bin/ffmpeg .
+      - name: Fetch deno (JS 런타임 — 유튜브 챌린지 해결용, 동봉)
+        run: |
+          curl -L -o deno.zip https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip
+          unzip -o deno.zip
+      - name: Build binary
+        run: pyinstaller --onefile --windowed --name YoutubeMP4-linux --add-binary "ffmpeg:." --add-binary "deno:." --collect-all yt_dlp_ejs youtube_mp4.py
+      - name: Upload linux asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag }}
+          files: dist/YoutubeMP4-linux

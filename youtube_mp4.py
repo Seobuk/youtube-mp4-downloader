@@ -18,7 +18,7 @@ import yt_dlp
 
 GITHUB_REPO = "Seobuk/youtube-mp4-downloader"
 APP_VERSION = "dev"  # 릴리즈 빌드 시 워크플로우가 태그로 치환
-EXE_NAME = "YoutubeMP4.exe"
+EXE_NAME = "YoutubeMP4.exe" if os.name == "nt" else "YoutubeMP4-linux"  # 자동 업데이트가 찾는 릴리즈 에셋
 
 
 def format_status(d):
@@ -187,6 +187,8 @@ def swap_exe(exe, new):
     old.unlink(missing_ok=True)
     exe.rename(old)  # 윈도우도 실행 중인 exe의 rename은 허용됨
     new.rename(exe)
+    if os.name != "nt":
+        exe.chmod(0o755)  # 리눅스: 새로 받은 파일엔 실행 비트가 없음
 
 
 def cleanup_old_exe():
