@@ -67,11 +67,19 @@ def build_format(height=None):
             f"best{h}[ext=mp4]/best{h}/best")
 
 
-def download(url, out_dir, report, height=None, playlist=None):
+def needs_login_retry(err):
+    """유튜브가 비로그인/자동화 클라이언트만 막을 때의 오류인지 (브라우저 쿠키로 재시도 가치)."""
+    e = str(err).lower()
+    return any(k in e for k in ("not available", "403", "forbidden",
+                                "sign in", "age", "private video", "bot"))
+
+
+def download(url, out_dir, report, height=None, playlist=None, cookies_from=None):
     """url을 out_dir에 mp4로 저장. report(pct, msg)로 진행 상황 통지.
     height를 주면 그 해상도 이하 중 최선으로 (용량 조절용).
     재생목록이면 재생목록 제목 폴더를 만들어 전체 다운로드.
-    playlist=None이면 URL 형태로 자동 판별, True/False로 강제 지정 가능."""
+    playlist=None이면 URL 형태로 자동 판별, True/False로 강제 지정 가능.
+    cookies_from에 브라우저 이름을 주면 그 브라우저의 로그인 쿠키로 인증."""
     if playlist is None:
         playlist = is_playlist(url)
     name = ("%(playlist_title)s/%(playlist_index)02d %(title)s.%(ext)s"
@@ -88,6 +96,8 @@ def download(url, out_dir, report, height=None, playlist=None):
         "no_warnings": True,
         "ffmpeg_location": find_ffmpeg(),
     }
+    if cookies_from:
+        opts["cookiesfrombrowser"] = (cookies_from,)
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
     if playlist:
@@ -291,16 +301,29 @@ def run_gui(exec_=True):
             def work(report):
                 try:
                     download(url, out_dir, report, height, playlist)
+                    return
                 except Exception as e:  # 네트워크/포맷 오류를 GUI에 그대로 표시
-                    # exe에서 실패하면 yt-dlp가 낡았을 수 있음 → 새 릴리즈 있으면 자동 교체
-                    if getattr(sys, "frozen", False):
+                    first_err = e
+                # 유튜브가 비로그인 클라이언트만 막는 오류(연령 제한, 403 등)면
+                # 설치된 브라우저의 로그인 쿠키를 빌려 재시도
+                if needs_login_retry(first_err):
+                    for browser in ("chrome", "edge", "firefox"):
                         try:
-                            report(0, f"오류: {e} — 새 버전 확인 중...")
-                            if update_app(report, skip_same=True):
-                                return True
+                            report(0, f"{browser} 로그인 정보로 재시도 중...")
+                            download(url, out_dir, report, height, playlist,
+                                     cookies_from=browser)
+                            return
                         except Exception:
-                            pass  # 업데이트 확인 실패 시 원래 오류 표시
-                    report(0, f"오류: {e}")
+                            continue
+                # exe에서 실패하면 yt-dlp가 낡았을 수 있음 → 새 릴리즈 있으면 자동 교체
+                if getattr(sys, "frozen", False):
+                    try:
+                        report(0, f"오류: {first_err} — 새 버전 확인 중...")
+                        if update_app(report, skip_same=True):
+                            return True
+                    except Exception:
+                        pass  # 업데이트 확인 실패 시 원래 오류 표시
+                report(0, f"오류: {first_err}")
 
             self._run(work)
 
@@ -361,6 +384,37 @@ def _selfcheck():
     assert p == 0
     p, m = format_status({"status": "finished"})
     assert p == 100 and "병합" in m
+    # 쿠키 재시도 판별: 실제 관측된 두 오류 유형은 참, 일반 오류는 거짓
+    assert needs_login_retry("ERROR: [youtube] q1DinydBRNE: This video is not available")
+    assert needs_login_retry("ERROR: unable to download video data: HTTP Error 403: Forbidden")
+    assert needs_login_retry("Sign in to confirm your age")
+    assert not needs_login_retry("HTTP Error 404: Not Found")
+    # cookies_from 지정 시 yt-dlp 옵션에 반영되는지 (가짜 YoutubeDL로 캡처)
+    captured = {}
+
+    class FakeYDL:
+        def __init__(self, opts):
+            captured.update(opts)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def extract_info(self, url, download):
+            return {"title": "t"}
+
+    orig_ydl = yt_dlp.YoutubeDL
+    yt_dlp.YoutubeDL = FakeYDL
+    try:
+        download("https://youtu.be/x", ".", lambda p, m: None, cookies_from="edge")
+        assert captured["cookiesfrombrowser"] == ("edge",), captured
+        captured.clear()
+        download("https://youtu.be/x", ".", lambda p, m: None)
+        assert "cookiesfrombrowser" not in captured
+    finally:
+        yt_dlp.YoutubeDL = orig_ydl
     # 재생목록 판별: /playlist 링크만 전체 다운로드, watch+list는 영상 1개
     assert is_playlist("https://www.youtube.com/playlist?list=PLYU_yAU_QLzY")
     assert not is_playlist("https://www.youtube.com/watch?v=abc&list=PLYU&index=3")
