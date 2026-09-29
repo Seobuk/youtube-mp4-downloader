@@ -148,8 +148,11 @@ def download(url, out_dir, report, height=None, playlist=None, cookies_from=None
     if playlist:
         done = [e for e in info.get("entries") or [] if e]
         report(100, f"완료: 재생목록 '{info.get('title', '')}' 영상 {len(done)}개")
-    else:
-        report(100, f"완료: {info.get('title', '')}.mp4")
+        return None
+    report(100, f"완료: {info.get('title', '')}.mp4")
+    # 편집 탭에 바로 넘길 수 있게 저장된 파일 경로 반환
+    return next((d.get("filepath") for d in info.get("requested_downloads") or []
+                 if d.get("filepath")), None)
 
 
 def update_ytdlp(report):
@@ -244,12 +247,142 @@ def _update_app(report, skip_same):
     return True
 
 
+# ---- 영상 편집 (자르기 / WMV 변환 / GIF) — 번들 ffmpeg 사용 ----
+
+EDIT_MODES = {  # 모드 -> (확장자, 파일명 접미사)
+    "mp4": ("mp4", "cut"),
+    "wmv": ("wmv", "wmv"),
+    "gif": ("gif", "gif"),
+}
+
+
+def parse_time(s):
+    """'90', '1:30', '0:01:30.5' -> 초(float). 빈 문자열은 None. 잘못된 형식은 ValueError."""
+    s = (s or "").strip()
+    if not s:
+        return None
+    parts = s.split(":")
+    if len(parts) > 3:
+        raise ValueError(f"시간 형식 오류: {s}")
+    sec = 0.0
+    for p in parts:
+        sec = sec * 60 + float(p)
+    if sec < 0:
+        raise ValueError(f"시간 형식 오류: {s}")
+    return sec
+
+
+def unique_path(p):
+    """p가 이미 있으면 'name (2).ext' 식으로 비어 있는 이름을 찾음 (덮어쓰기 방지)."""
+    p = Path(p)
+    n = 2
+    while p.exists():
+        p = p.with_name(f"{p.stem.rsplit(' (', 1)[0]} ({n}){p.suffix}")
+        n += 1
+    return p
+
+
+def edit_output_path(src, mode):
+    """원본 옆에 '이름_cut.mp4' / '이름_wmv.wmv' / '이름_gif.gif'."""
+    ext, suffix = EDIT_MODES[mode]
+    src = Path(src)
+    return unique_path(src.with_name(f"{src.stem}_{suffix}.{ext}"))
+
+
+def build_edit_cmd(ffmpeg, src, dst, mode, start=None, end=None, gif_fps=12, gif_width=480):
+    """ffmpeg 명령 리스트. start/end(초)로 구간 자르기 — 모든 모드에 적용.
+    재인코딩으로 자르므로 키프레임과 무관하게 정확한 위치에서 잘림."""
+    cmd = [ffmpeg, "-hide_banner", "-y"]
+    if start:
+        cmd += ["-ss", f"{start:.3f}"]  # 입력 앞 -ss: 빠른 탐색 + (재인코딩 시) 정확
+    cmd += ["-i", str(src)]
+    if end is not None:
+        cmd += ["-t", f"{end - (start or 0):.3f}"]
+    if mode == "mp4":
+        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+                "-movflags", "+faststart"]
+    elif mode == "wmv":
+        # wmv2 + wmav2: 윈도우 기본 플레이어·구버전 파워포인트 호환
+        cmd += ["-c:v", "wmv2", "-q:v", "2", "-c:a", "wmav2", "-b:a", "192k"]
+    elif mode == "gif":
+        # 팔레트 생성 후 적용 — 기본 256색 GIF보다 훨씬 깨끗함
+        vf = (f"fps={gif_fps},scale={gif_width}:-1:flags=lanczos,"
+              "split[a][b];[a]palettegen[p];[b][p]paletteuse")
+        cmd += ["-vf", vf, "-an", "-loop", "0"]
+    else:
+        raise ValueError(mode)
+    cmd += ["-progress", "pipe:1", "-nostats", str(dst)]
+    return cmd
+
+
+def _no_window():
+    """윈도우 windowed exe에서 ffmpeg 콘솔 창이 뜨지 않도록."""
+    return {"creationflags": 0x08000000} if os.name == "nt" else {}  # CREATE_NO_WINDOW
+
+
+def probe_duration(ffmpeg, src):
+    """ffmpeg -i 출력의 'Duration: HH:MM:SS.xx'로 길이(초). 모르면 None."""
+    r = subprocess.run([ffmpeg, "-hide_banner", "-i", str(src)], capture_output=True,
+                       text=True, encoding="utf-8", errors="replace", **_no_window())
+    for line in r.stderr.splitlines():
+        line = line.strip()
+        if line.startswith("Duration:"):
+            try:
+                return parse_time(line.split(",")[0].split(":", 1)[1])
+            except ValueError:
+                return None
+    return None
+
+
+def edit_video(src, mode, report, start=None, end=None, gif_fps=12, gif_width=480):
+    """src 영상을 mode(mp4/wmv/gif)로 변환(+구간 자르기)해 원본 옆에 저장. 결과 경로 반환."""
+    ffmpeg = find_tool("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg가 없습니다")
+    src = Path(src)
+    if not src.is_file():
+        raise RuntimeError(f"파일이 없습니다: {src}")
+    total = probe_duration(ffmpeg, src)
+    if end is not None and total:
+        end = min(end, total)
+    if start and total and start >= total:
+        raise RuntimeError("시작 시간이 영상 길이보다 깁니다")
+    if end is not None and end <= (start or 0):
+        raise RuntimeError("끝 시간은 시작 시간보다 커야 합니다")
+    span = (end if end is not None else total or 0) - (start or 0)
+    dst = edit_output_path(src, mode)
+    cmd = build_edit_cmd(ffmpeg, src, dst, mode, start, end, gif_fps, gif_width)
+    label = {"mp4": "자르는 중", "wmv": "WMV 변환 중", "gif": "GIF 만드는 중"}[mode]
+    report(0, f"{label}...")
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                         encoding="utf-8", errors="replace", **_no_window())
+    err_tail = []
+    # stderr를 따로 비워주지 않으면 파이프가 차서 ffmpeg가 멈출 수 있음
+    t = threading.Thread(target=lambda: err_tail.extend(p.stderr.read().splitlines()[-5:]),
+                         daemon=True)
+    t.start()
+    for line in p.stdout:
+        k, _, v = line.strip().partition("=")
+        if k == "out_time_us" and span > 0 and v.isdigit():
+            pct = min(int(v) / 1e6 / span * 100, 99.9)
+            report(pct, f"{label}... {pct:5.1f}%")
+    p.wait()
+    t.join(timeout=5)
+    if p.returncode != 0:
+        dst.unlink(missing_ok=True)
+        raise RuntimeError(err_tail[-1] if err_tail else f"ffmpeg 오류 ({p.returncode})")
+    report(100, f"완료: {dst.name}")
+    return dst
+
+
 def run_gui(exec_=True):
     """GUI 실행. exec_=False면 이벤트 루프를 돌리지 않고 (app, win) 반환 (테스트용)."""
     from PyQt6.QtCore import pyqtSignal
     from PyQt6.QtWidgets import (
-        QApplication, QComboBox, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
-        QMessageBox, QProgressBar, QPushButton, QVBoxLayout, QWidget,
+        QApplication, QComboBox, QFileDialog, QGroupBox, QHBoxLayout, QLabel,
+        QLineEdit, QMessageBox, QProgressBar, QPushButton, QSpinBox, QVBoxLayout,
+        QWidget,
     )
 
     cleanup_old_exe()
@@ -259,6 +392,7 @@ def run_gui(exec_=True):
         status_signal = pyqtSignal(float, str)
         done_signal = pyqtSignal()
         restart_signal = pyqtSignal()  # 자동 업데이트 후 앱 종료 (새 exe가 이미 실행됨)
+        file_signal = pyqtSignal(str)  # 다운로드 완료 파일 -> 편집 원본 칸
 
         def __init__(self):
             super().__init__()
@@ -299,6 +433,7 @@ def run_gui(exec_=True):
             root.addWidget(QLabel("화질 (낮출수록 용량 작음 · mp4/H.264라 PPT 삽입 가능)"))
             root.addWidget(self.quality)
             root.addWidget(self.go)
+            root.addWidget(self._build_edit_box())
             root.addWidget(self.bar)
             root.addWidget(self.status)
             foot = QHBoxLayout()
@@ -310,6 +445,74 @@ def run_gui(exec_=True):
             self.status_signal.connect(self._on_status)
             self.done_signal.connect(lambda: self._busy(False))
             self.restart_signal.connect(QApplication.instance().quit)
+            self.file_signal.connect(self.src.setText)
+
+        def _build_edit_box(self):
+            """영상 편집: 구간 자르기 / WMV 변환 / GIF 만들기 (원본 옆에 새 파일로 저장)."""
+            box = QGroupBox("영상 편집 (자르기 · WMV · GIF)")
+            self.src = QLineEdit(placeholderText="편집할 영상 파일 (다운로드하면 자동 입력)")
+            src_pick = QPushButton("파일", clicked=self.pick_src)
+            self.start = QLineEdit(placeholderText="처음부터")
+            self.end = QLineEdit(placeholderText="끝까지")
+            for w in (self.start, self.end):
+                w.setToolTip("초(90) 또는 분:초(1:30) 또는 시:분:초(0:01:30.5)")
+            self.mode = QComboBox()
+            for label, m in [("MP4 (구간 자르기)", "mp4"), ("WMV로 변환", "wmv"),
+                             ("GIF 만들기", "gif")]:
+                self.mode.addItem(label, m)
+            self.fps = QSpinBox(minimum=1, maximum=30, value=12, suffix=" fps")
+            self.gif_w = QSpinBox(minimum=120, maximum=1920, value=480, singleStep=40,
+                                  suffix=" px")
+            self.gif_opts = QWidget()
+            g = QHBoxLayout(self.gif_opts)
+            g.setContentsMargins(0, 0, 0, 0)
+            g.addWidget(QLabel("GIF"))
+            g.addWidget(self.fps)
+            g.addWidget(QLabel("가로"))
+            g.addWidget(self.gif_w)
+            g.addStretch()
+            self.mode.currentIndexChanged.connect(
+                lambda: self.gif_opts.setVisible(self.mode.currentData() == "gif"))
+            self.gif_opts.setVisible(False)
+            self.edit_go = QPushButton("변환 시작", clicked=self.start_edit)
+            self.edit_go.setStyleSheet(
+                "background:#457b9d; color:#fff; font-weight:600;"
+                "padding:8px; border:0; border-radius:6px;")
+
+            lay = QVBoxLayout(box)
+            r1 = QHBoxLayout()
+            r1.addWidget(self.src)
+            r1.addWidget(src_pick)
+            lay.addLayout(r1)
+            r2 = QHBoxLayout()
+            r2.addWidget(QLabel("시작"))
+            r2.addWidget(self.start)
+            r2.addWidget(QLabel("끝"))
+            r2.addWidget(self.end)
+            r2.addWidget(self.mode)
+            lay.addLayout(r2)
+            lay.addWidget(self.gif_opts)
+            lay.addWidget(self.edit_go)
+            return box
+
+        def pick_src(self):
+            f, _ = QFileDialog.getOpenFileName(
+                self, "편집할 영상 선택", self.src.text() or self.dir.text(),
+                "영상 (*.mp4 *.mkv *.webm *.mov *.avi *.wmv *.m4v);;모든 파일 (*)")
+            if f:
+                self.src.setText(f)
+
+        def start_edit(self):
+            src = self.src.text().strip()
+            if not src:
+                return self._on_status(0, "편집할 파일을 선택하세요")
+            try:
+                start, end = parse_time(self.start.text()), parse_time(self.end.text())
+            except ValueError as e:
+                return self._on_status(0, str(e))
+            mode, fps, width = self.mode.currentData(), self.fps.value(), self.gif_w.value()
+            self._run(lambda report: edit_video(src, mode, report, start, end, fps, width)
+                      and None)
 
         def pick_dir(self):
             d = QFileDialog.getExistingDirectory(self, "저장 폴더 선택", self.dir.text())
@@ -352,7 +555,9 @@ def run_gui(exec_=True):
                     if label:
                         report(0, label)
                     try:
-                        download(url, out_dir, report, height, playlist, **kw)
+                        path = download(url, out_dir, report, height, playlist, **kw)
+                        if path:
+                            self.file_signal.emit(path)
                         return True
                     except Exception as e:
                         errors.append((label or "기본 시도", str(e)))
@@ -419,12 +624,13 @@ def run_gui(exec_=True):
 
         def _busy(self, on):
             self.go.setDisabled(on)
+            self.edit_go.setDisabled(on)
             self.upd.setDisabled(on)
 
         def _report(self, pct, msg):
             # 다운로드 진행 틱을 1% 단위로 스로틀 (시그널 폭주 방지)
             ip = int(pct)
-            if "다운로드 중" in msg and ip == self._last_pct:
+            if ("다운로드 중" in msg or msg.endswith("%")) and ip == self._last_pct:
                 return
             self._last_pct = ip
             self.status_signal.emit(pct, msg)
@@ -566,6 +772,54 @@ def _selfcheck():
         assert exe.read_text() == "new"
         assert (Path(td) / "app.old.exe").read_text() == "old"
         assert not new.exists()
+    # 편집: 시간 파싱
+    assert parse_time("") is None and parse_time("90") == 90
+    assert parse_time("1:30") == 90 and parse_time("0:01:30.5") == 90.5
+    for bad in ("a", "1:2:3:4", "-5"):
+        try:
+            parse_time(bad)
+            raise AssertionError(bad)
+        except ValueError:
+            pass
+    # 편집: 명령 구성 — 구간은 -ss/-t, 모드별 코덱
+    c = build_edit_cmd("ff", "a.mp4", "b.mp4", "mp4", 10, 25)
+    assert c[c.index("-ss") + 1] == "10.000" and c[c.index("-t") + 1] == "15.000", c
+    assert c.index("-ss") < c.index("-i") and "libx264" in c, c
+    c = build_edit_cmd("ff", "a.mp4", "b.wmv", "wmv")
+    assert "-ss" not in c and "-t" not in c and "wmv2" in c and "wmav2" in c, c
+    c = build_edit_cmd("ff", "a.mp4", "b.gif", "gif", gif_fps=10, gif_width=320)
+    vf = c[c.index("-vf") + 1]
+    assert "fps=10" in vf and "scale=320" in vf and "paletteuse" in vf and "-an" in c, c
+    # 편집: 출력 이름은 덮어쓰지 않음
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "clip.mp4"
+        assert edit_output_path(src, "gif").name == "clip_gif.gif"
+        (Path(td) / "clip_gif.gif").touch()
+        assert edit_output_path(src, "gif").name == "clip_gif (2).gif"
+        (Path(td) / "clip_gif (2).gif").touch()
+        assert edit_output_path(src, "gif").name == "clip_gif (3).gif"
+    # 편집: ffmpeg가 있으면 실제 변환까지 (3초 테스트 영상 -> 자르기/WMV/GIF)
+    ff = find_tool("ffmpeg")
+    if ff:
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "t.mp4"
+            subprocess.run([ff, "-v", "error", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=25",
+                            "-f", "lavfi", "-i", "sine", "-t", "3", "-pix_fmt", "yuv420p",
+                            str(src)], check=True, **_no_window())
+            assert abs(probe_duration(ff, src) - 3) < 0.2
+            pcts = []
+            out = edit_video(src, "mp4", lambda p, m: pcts.append(p), start=1, end=2)
+            assert out.name == "t_cut.mp4" and abs(probe_duration(ff, out) - 1) < 0.2
+            assert pcts[-1] == 100
+            out = edit_video(src, "wmv", lambda p, m: None)
+            assert out.suffix == ".wmv" and out.stat().st_size > 0
+            out = edit_video(src, "gif", lambda p, m: None, end=1, gif_width=160)
+            assert out.read_bytes()[:3] == b"GIF"
+            try:
+                edit_video(src, "gif", lambda p, m: None, start=2, end=1)
+                raise AssertionError("역순 구간 허용됨")
+            except RuntimeError:
+                pass
     print("selfcheck ok")
 
 
