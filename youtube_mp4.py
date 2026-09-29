@@ -376,13 +376,436 @@ def edit_video(src, mode, report, start=None, end=None, gif_fps=12, gif_width=48
     return dst
 
 
+def fmt_time(sec, precise=True):
+    """초 -> '1:02:03.45' / '02:03.45' (precise=False면 소수점 없이). parse_time과 왕복 가능."""
+    sec = max(0.0, sec)
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    ss = f"{s:05.2f}" if precise else f"{int(s):02d}"
+    return f"{int(h)}:{int(m):02d}:{ss}" if h >= 1 else f"{int(m):02d}:{ss}"
+
+
+def build_thumb_cmd(ffmpeg, src, out_dir, duration, count=24, height=72):
+    """타임라인용 썸네일 count장을 영상 전체에 고르게 뽑는 ffmpeg 명령 (thumb_001.jpg ...)."""
+    rate = count / max(duration, 0.1)
+    return [ffmpeg, "-hide_banner", "-v", "error", "-y", "-i", str(src),
+            "-vf", f"fps={rate:.6f},scale=-2:{height}", "-frames:v", str(count),
+            "-q:v", "5", str(Path(out_dir) / "thumb_%03d.jpg")]
+
+
+def tick_step(duration, width, min_px=70):
+    """타임라인 눈금 간격(초): 눈금 사이가 min_px 이상 되는 가장 작은 '보기 좋은' 값."""
+    for step in (0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600):
+        if duration <= 0 or step / duration * width >= min_px:
+            return step
+    return 7200
+
+
+_EDITOR_CLS = None
+
+
+def open_editor(parent, src):
+    """영상 편집기 창 열기: 미리보기 재생 + 썸네일 타임라인에서 시작/끝 핸들을 끌어 구간 지정,
+    그 구간을 MP4 자르기 / WMV / GIF로 내보내기."""
+    global _EDITOR_CLS
+    if _EDITOR_CLS is None:
+        _EDITOR_CLS = _make_editor_class()
+    dlg = _EDITOR_CLS(parent, src)
+    dlg.show()
+    return dlg
+
+
+def _make_editor_class():
+    import tempfile
+    from PyQt6.QtCore import QRect, QRectF, Qt, QUrl, pyqtSignal
+    from PyQt6.QtGui import QColor, QKeySequence, QPainter, QPen, QPixmap, QPolygonF, QShortcut
+    from PyQt6.QtCore import QPointF
+    from PyQt6.QtMultimedia import QAudioOutput, QMediaMetaData, QMediaPlayer
+    from PyQt6.QtMultimediaWidgets import QVideoWidget
+    from PyQt6.QtWidgets import (
+        QComboBox, QDialog, QHBoxLayout, QLabel, QLineEdit, QProgressBar, QPushButton,
+        QSizePolicy, QSpinBox, QVBoxLayout, QWidget,
+    )
+
+    MIN_SPAN = 100  # ms — 시작/끝 핸들 최소 간격
+
+    class Timeline(QWidget):
+        """썸네일 스트립 + 시간 눈금 + 구간 핸들 + 재생 헤드. 모든 시간은 ms."""
+        seek = pyqtSignal(int)
+        range_changed = pyqtSignal(int, int)
+
+        RULER, PAD, HANDLE = 18, 10, 9
+
+        def __init__(self):
+            super().__init__()
+            self.setMinimumHeight(96)
+            self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            self.setMouseTracking(True)
+            self.dur = self.pos_ms = self.a = self.b = 0
+            self.thumbs = []
+            self._drag = None  # 'a' | 'b' | 'seek'
+
+        # 좌표 변환
+        def _w(self):
+            return max(1, self.width() - 2 * self.PAD)
+
+        def x_of(self, ms):
+            return self.PAD + (ms / self.dur * self._w() if self.dur else 0)
+
+        def ms_of(self, x):
+            return int(min(max((x - self.PAD) / self._w(), 0), 1) * self.dur)
+
+        def set_duration(self, ms):
+            self.dur, self.a, self.b = ms, 0, ms
+            self.update()
+
+        def set_position(self, ms):
+            self.pos_ms = ms
+            self.update()
+
+        def set_range(self, a, b, emit=True):
+            a = max(0, min(a, self.dur - MIN_SPAN))
+            b = min(self.dur, max(b, a + MIN_SPAN))
+            self.a, self.b = a, b
+            self.update()
+            if emit:
+                self.range_changed.emit(a, b)
+
+        def paintEvent(self, _):
+            p = QPainter(self)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            w, h = self.width(), self.height()
+            p.fillRect(self.rect(), QColor("#1e1e24"))
+            strip = QRect(self.PAD, self.RULER, self._w(), h - self.RULER - 4)
+            # 눈금
+            p.setPen(QColor("#9a9aa5"))
+            f = p.font()
+            f.setPixelSize(10)
+            p.setFont(f)
+            if self.dur:
+                step = tick_step(self.dur / 1000, self._w())
+                t = 0.0
+                while t * 1000 <= self.dur:
+                    x = int(self.x_of(t * 1000))
+                    p.drawLine(x, self.RULER - 5, x, self.RULER - 1)
+                    p.drawText(x + 3, self.RULER - 6, fmt_time(t, precise=step < 1))
+                    t += step
+            # 썸네일 (칸 비율에 맞춰 가운데 크롭)
+            p.fillRect(strip, QColor("#2b2b33"))
+            if self.thumbs:
+                cw = strip.width() / len(self.thumbs)
+                for i, pix in enumerate(self.thumbs):
+                    cell = QRectF(strip.x() + i * cw, strip.y(), cw + 1, strip.height())
+                    sw = min(pix.width(), pix.height() * cell.width() / cell.height())
+                    srect = QRectF((pix.width() - sw) / 2, 0, sw, pix.height())
+                    p.drawPixmap(cell, pix, srect)
+            if not self.dur:
+                return
+            xa, xb = self.x_of(self.a), self.x_of(self.b)
+            # 선택 밖은 어둡게
+            dim = QColor(0, 0, 0, 170)
+            p.fillRect(QRectF(strip.x(), strip.y(), xa - strip.x(), strip.height()), dim)
+            p.fillRect(QRectF(xb, strip.y(), strip.right() - xb + 1, strip.height()), dim)
+            # 선택 테두리 + 핸들
+            yellow = QColor("#ffc233")
+            p.setPen(QPen(yellow, 3))
+            p.drawLine(QPointF(xa, strip.top() + 1), QPointF(xb, strip.top() + 1))
+            p.drawLine(QPointF(xa, strip.bottom()), QPointF(xb, strip.bottom()))
+            p.setPen(Qt.PenStyle.NoPen)
+            for x, left in ((xa, True), (xb, False)):
+                r = QRectF(x - self.HANDLE if left else x, strip.top(), self.HANDLE,
+                           strip.height() + 1)
+                p.setBrush(yellow)
+                p.drawRoundedRect(r, 3, 3)
+                p.setBrush(QColor("#6b4e00"))
+                p.drawRect(QRectF(r.center().x() - 1, r.center().y() - 8, 2, 16))
+            # 재생 헤드
+            x = self.x_of(self.pos_ms)
+            p.setPen(QPen(QColor("#ff4d4d"), 2))
+            p.drawLine(QPointF(x, 2), QPointF(x, h - 2))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor("#ff4d4d"))
+            p.drawPolygon(QPolygonF([QPointF(x - 6, 0), QPointF(x + 6, 0), QPointF(x, 8)]))
+
+        def _hit(self, x):
+            xa, xb = self.x_of(self.a), self.x_of(self.b)
+            if xa - self.HANDLE - 2 <= x <= xa + 3:
+                return "a"
+            if xb - 3 <= x <= xb + self.HANDLE + 2:
+                return "b"
+            return None
+
+        def mousePressEvent(self, e):
+            if not self.dur:
+                return
+            x = e.position().x()
+            self._drag = self._hit(x) or "seek"
+            self.mouseMoveEvent(e)
+
+        def mouseMoveEvent(self, e):
+            x = e.position().x()
+            if not self._drag:
+                self.setCursor(Qt.CursorShape.SizeHorCursor if self._hit(x)
+                               else Qt.CursorShape.PointingHandCursor)
+                return
+            ms = self.ms_of(x)
+            if self._drag == "a":
+                self.set_range(ms, self.b)
+                ms = self.a
+            elif self._drag == "b":
+                self.set_range(self.a, ms)
+                ms = self.b
+            self.seek.emit(ms)  # 핸들을 끄는 동안에도 그 위치 화면을 보여줌
+
+        def mouseReleaseEvent(self, _):
+            self._drag = None
+
+    class Editor(QDialog):
+        report_signal = pyqtSignal(float, str)
+        thumbs_signal = pyqtSignal(list)
+        done_signal = pyqtSignal()
+
+        def __init__(self, parent, src):
+            super().__init__(parent)
+            self.src = str(src)
+            self.setWindowTitle(f"영상 편집 — {Path(self.src).name}")
+            self.resize(960, 700)
+            self._range_play = False
+            self._frame_ms = 33
+            self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+
+            self.video = QVideoWidget()
+            self.video.setMinimumSize(480, 270)
+            self.video.setStyleSheet("background:#000;")
+            self.player = QMediaPlayer(self)
+            self.audio = QAudioOutput(self)
+            self.player.setAudioOutput(self.audio)
+            self.player.setVideoOutput(self.video)
+
+            def btn(text, slot, tip=""):
+                b = QPushButton(text, clicked=slot, toolTip=tip)
+                b.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # Space 등 단축키를 버튼이 먹지 않게
+                return b
+
+            self.play_btn = btn("▶ 재생", self.toggle_play, "재생/일시정지 (Space)")
+            prev_f = btn("◀|", lambda: self.step(-1), "이전 프레임 (←) · Shift+← 1초")
+            next_f = btn("|▶", lambda: self.step(1), "다음 프레임 (→) · Shift+→ 1초")
+            set_a = btn("[ 시작점", self.mark_a, "현재 위치를 시작점으로 (I)")
+            set_b = btn("끝점 ]", self.mark_b, "현재 위치를 끝점으로 (O)")
+            play_sel = btn("▶ 구간 재생", self.play_range, "선택 구간만 재생 (P)")
+            self.time_lbl = QLabel("00:00.00 / 00:00.00")
+            self.time_lbl.setStyleSheet("font-family:monospace; font-size:13px;")
+
+            self.timeline = Timeline()
+            self.timeline.seek.connect(self.player.setPosition)
+            self.timeline.range_changed.connect(self._on_range)
+
+            self.a_edit, self.b_edit = QLineEdit(), QLineEdit()
+            for e in (self.a_edit, self.b_edit):
+                e.setFixedWidth(100)
+                e.setToolTip("직접 입력도 가능: 90 / 1:30 / 0:01:30.5")
+                e.editingFinished.connect(self._typed_range)
+            self.len_lbl = QLabel()
+
+            self.mode = QComboBox()
+            for label, m in [("MP4 (구간 자르기)", "mp4"), ("WMV로 변환", "wmv"),
+                             ("GIF 만들기", "gif")]:
+                self.mode.addItem(label, m)
+            self.fps = QSpinBox(minimum=1, maximum=30, value=12, suffix=" fps")
+            self.gif_w = QSpinBox(minimum=120, maximum=1920, value=480, singleStep=40,
+                                  suffix=" px")
+            self.gif_opts = QWidget()
+            g = QHBoxLayout(self.gif_opts)
+            g.setContentsMargins(0, 0, 0, 0)
+            g.addWidget(QLabel("GIF"))
+            g.addWidget(self.fps)
+            g.addWidget(QLabel("가로"))
+            g.addWidget(self.gif_w)
+            self.mode.currentIndexChanged.connect(
+                lambda: self.gif_opts.setVisible(self.mode.currentData() == "gif"))
+            self.gif_opts.setVisible(False)
+            self.export_btn = QPushButton("내보내기", clicked=self.export)
+            self.export_btn.setStyleSheet(
+                "background:#457b9d; color:#fff; font-weight:600;"
+                "padding:8px 20px; border:0; border-radius:6px;")
+            self.bar = QProgressBar(textVisible=False, maximumHeight=8)
+            self.status = QLabel("타임라인의 노란 핸들을 끌거나 I/O 키로 구간을 지정하세요")
+
+            root = QVBoxLayout(self)
+            root.addWidget(self.video, 1)
+            ctl = QHBoxLayout()
+            for w in (prev_f, self.play_btn, next_f):
+                ctl.addWidget(w)
+            ctl.addWidget(self.time_lbl)
+            ctl.addStretch()
+            for w in (set_a, set_b, play_sel):
+                ctl.addWidget(w)
+            root.addLayout(ctl)
+            root.addWidget(self.timeline)
+            rng = QHBoxLayout()
+            rng.addWidget(QLabel("시작"))
+            rng.addWidget(self.a_edit)
+            rng.addWidget(QLabel("끝"))
+            rng.addWidget(self.b_edit)
+            rng.addWidget(self.len_lbl)
+            rng.addStretch()
+            rng.addWidget(self.gif_opts)
+            rng.addWidget(self.mode)
+            rng.addWidget(self.export_btn)
+            root.addLayout(rng)
+            root.addWidget(self.bar)
+            root.addWidget(self.status)
+
+            keys = [("Space", self.toggle_play), ("I", self.mark_a), ("O", self.mark_b),
+                    ("P", self.play_range), ("Left", lambda: self.step(-1)),
+                    ("Right", lambda: self.step(1)), ("Shift+Left", lambda: self.jump(-1000)),
+                    ("Shift+Right", lambda: self.jump(1000)),
+                    ("Home", lambda: self.player.setPosition(self.timeline.a)),
+                    ("End", lambda: self.player.setPosition(self.timeline.b))]
+            for k, fn in keys:
+                QShortcut(QKeySequence(k), self, activated=fn)
+
+            self.player.durationChanged.connect(self._on_duration)
+            self.player.positionChanged.connect(self._on_position)
+            self.player.playbackStateChanged.connect(self._on_state)
+            self.player.errorOccurred.connect(
+                lambda _e, msg: self.status.setText(f"미리보기 오류: {msg}"))
+            self.player.mediaStatusChanged.connect(self._on_media_status)
+            self.report_signal.connect(self._on_report)
+            self.thumbs_signal.connect(self._on_thumbs)
+            self.done_signal.connect(lambda: self.export_btn.setDisabled(False))
+            self.player.setSource(QUrl.fromLocalFile(self.src))
+
+        # ---- 재생 ----
+        def _on_media_status(self, st):
+            if st == QMediaPlayer.MediaStatus.LoadedMedia:
+                fr = self.player.metaData().value(QMediaMetaData.Key.VideoFrameRate)
+                if fr:
+                    self._frame_ms = max(1, round(1000 / float(fr)))
+                self.player.pause()  # 첫 프레임 표시
+
+        def _on_duration(self, ms):
+            self.timeline.set_duration(ms)
+            self._on_range(0, ms)
+            self._make_thumbs(ms / 1000)
+
+        def _on_position(self, ms):
+            self.timeline.set_position(ms)
+            self.time_lbl.setText(f"{fmt_time(ms / 1000)} / "
+                                  f"{fmt_time(self.timeline.dur / 1000)}")
+            if self._range_play and ms >= self.timeline.b:
+                self._range_play = False
+                self.player.pause()
+                self.player.setPosition(self.timeline.b)
+
+        def _on_state(self, st):
+            playing = st == QMediaPlayer.PlaybackState.PlayingState
+            self.play_btn.setText("⏸ 정지" if playing else "▶ 재생")
+            if not playing:
+                self._range_play = False
+
+        def toggle_play(self):
+            if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+                self.player.pause()
+            else:
+                if self.player.position() >= self.timeline.dur - 50:
+                    self.player.setPosition(0)
+                self.player.play()
+
+        def play_range(self):
+            self.player.setPosition(self.timeline.a)
+            self.player.play()
+            self._range_play = True
+
+        def step(self, frames):
+            self.player.pause()
+            self.jump(frames * self._frame_ms)
+
+        def jump(self, ms):
+            self.player.setPosition(max(0, min(self.player.position() + ms, self.timeline.dur)))
+
+        # ---- 구간 ----
+        def mark_a(self):
+            self.timeline.set_range(self.player.position(), self.timeline.b)
+
+        def mark_b(self):
+            self.timeline.set_range(self.timeline.a, self.player.position())
+
+        def _on_range(self, a, b):
+            self.a_edit.setText(fmt_time(a / 1000))
+            self.b_edit.setText(fmt_time(b / 1000))
+            self.len_lbl.setText(f"길이 {fmt_time((b - a) / 1000)}")
+
+        def _typed_range(self):
+            try:
+                a, b = parse_time(self.a_edit.text()), parse_time(self.b_edit.text())
+            except ValueError as e:
+                self.status.setText(str(e))
+                return self._on_range(self.timeline.a, self.timeline.b)
+            a = 0 if a is None else int(a * 1000)
+            b = self.timeline.dur if b is None else int(b * 1000)
+            self.timeline.set_range(a, b)
+            self.player.setPosition(self.timeline.a)
+
+        # ---- 썸네일 (백그라운드 ffmpeg) ----
+        def _make_thumbs(self, dur):
+            ff = find_tool("ffmpeg")
+            if not ff or dur <= 0:
+                return
+
+            def work():
+                try:
+                    subprocess.run(build_thumb_cmd(ff, self.src, self._tmp.name, dur),
+                                   capture_output=True, timeout=120, **_no_window())
+                except Exception:
+                    return
+                self.thumbs_signal.emit(sorted(str(p) for p in
+                                               Path(self._tmp.name).glob("thumb_*.jpg")))
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def _on_thumbs(self, paths):
+            self.timeline.thumbs = [QPixmap(p) for p in paths]
+            self.timeline.update()
+
+        # ---- 내보내기 ----
+        def export(self):
+            self.player.pause()
+            tl = self.timeline
+            start = tl.a / 1000 if tl.a > 0 else None
+            end = tl.b / 1000 if tl.b < tl.dur else None
+            mode, fps, width = self.mode.currentData(), self.fps.value(), self.gif_w.value()
+            self.export_btn.setDisabled(True)
+
+            def work():
+                try:
+                    edit_video(self.src, mode, self.report_signal.emit, start, end, fps, width)
+                except Exception as e:
+                    self.report_signal.emit(0, f"오류: {e}")
+                finally:
+                    self.done_signal.emit()
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def _on_report(self, pct, msg):
+            self.bar.setValue(int(pct))
+            self.status.setText(msg)
+
+        def closeEvent(self, e):
+            self.player.stop()
+            self.player.setSource(QUrl())
+            self._tmp.cleanup()
+            super().closeEvent(e)
+
+    return Editor
+
+
 def run_gui(exec_=True):
     """GUI 실행. exec_=False면 이벤트 루프를 돌리지 않고 (app, win) 반환 (테스트용)."""
     from PyQt6.QtCore import pyqtSignal
     from PyQt6.QtWidgets import (
         QApplication, QComboBox, QFileDialog, QGroupBox, QHBoxLayout, QLabel,
-        QLineEdit, QMessageBox, QProgressBar, QPushButton, QSpinBox, QVBoxLayout,
-        QWidget,
+        QLineEdit, QMessageBox, QProgressBar, QPushButton, QVBoxLayout, QWidget,
     )
 
     cleanup_old_exe()
@@ -448,50 +871,19 @@ def run_gui(exec_=True):
             self.file_signal.connect(self.src.setText)
 
         def _build_edit_box(self):
-            """영상 편집: 구간 자르기 / WMV 변환 / GIF 만들기 (원본 옆에 새 파일로 저장)."""
+            """영상 편집: 편집기 창에서 화면을 보며 구간 지정 → 자르기 / WMV / GIF."""
             box = QGroupBox("영상 편집 (자르기 · WMV · GIF)")
             self.src = QLineEdit(placeholderText="편집할 영상 파일 (다운로드하면 자동 입력)")
             src_pick = QPushButton("파일", clicked=self.pick_src)
-            self.start = QLineEdit(placeholderText="처음부터")
-            self.end = QLineEdit(placeholderText="끝까지")
-            for w in (self.start, self.end):
-                w.setToolTip("초(90) 또는 분:초(1:30) 또는 시:분:초(0:01:30.5)")
-            self.mode = QComboBox()
-            for label, m in [("MP4 (구간 자르기)", "mp4"), ("WMV로 변환", "wmv"),
-                             ("GIF 만들기", "gif")]:
-                self.mode.addItem(label, m)
-            self.fps = QSpinBox(minimum=1, maximum=30, value=12, suffix=" fps")
-            self.gif_w = QSpinBox(minimum=120, maximum=1920, value=480, singleStep=40,
-                                  suffix=" px")
-            self.gif_opts = QWidget()
-            g = QHBoxLayout(self.gif_opts)
-            g.setContentsMargins(0, 0, 0, 0)
-            g.addWidget(QLabel("GIF"))
-            g.addWidget(self.fps)
-            g.addWidget(QLabel("가로"))
-            g.addWidget(self.gif_w)
-            g.addStretch()
-            self.mode.currentIndexChanged.connect(
-                lambda: self.gif_opts.setVisible(self.mode.currentData() == "gif"))
-            self.gif_opts.setVisible(False)
-            self.edit_go = QPushButton("변환 시작", clicked=self.start_edit)
+            self.edit_go = QPushButton("편집기 열기", clicked=self.start_edit)
             self.edit_go.setStyleSheet(
                 "background:#457b9d; color:#fff; font-weight:600;"
                 "padding:8px; border:0; border-radius:6px;")
-
             lay = QVBoxLayout(box)
             r1 = QHBoxLayout()
             r1.addWidget(self.src)
             r1.addWidget(src_pick)
             lay.addLayout(r1)
-            r2 = QHBoxLayout()
-            r2.addWidget(QLabel("시작"))
-            r2.addWidget(self.start)
-            r2.addWidget(QLabel("끝"))
-            r2.addWidget(self.end)
-            r2.addWidget(self.mode)
-            lay.addLayout(r2)
-            lay.addWidget(self.gif_opts)
             lay.addWidget(self.edit_go)
             return box
 
@@ -501,18 +893,16 @@ def run_gui(exec_=True):
                 "영상 (*.mp4 *.mkv *.webm *.mov *.avi *.wmv *.m4v);;모든 파일 (*)")
             if f:
                 self.src.setText(f)
+                self.start_edit()
 
         def start_edit(self):
             src = self.src.text().strip()
-            if not src:
-                return self._on_status(0, "편집할 파일을 선택하세요")
-            try:
-                start, end = parse_time(self.start.text()), parse_time(self.end.text())
-            except ValueError as e:
-                return self._on_status(0, str(e))
-            mode, fps, width = self.mode.currentData(), self.fps.value(), self.gif_w.value()
-            self._run(lambda report: edit_video(src, mode, report, start, end, fps, width)
-                      and None)
+            if not src or not Path(src).is_file():
+                return self._on_status(0, "편집할 영상 파일을 선택하세요")
+            if not find_tool("ffmpeg"):
+                return self._on_status(0, "ffmpeg가 없습니다 (편집 불가)")
+            self._editors = [e for e in getattr(self, "_editors", []) if e.isVisible()]
+            self._editors.append(open_editor(self, src))
 
         def pick_dir(self):
             d = QFileDialog.getExistingDirectory(self, "저장 폴더 선택", self.dir.text())
@@ -623,8 +1013,7 @@ def run_gui(exec_=True):
             threading.Thread(target=work, daemon=True).start()
 
         def _busy(self, on):
-            self.go.setDisabled(on)
-            self.edit_go.setDisabled(on)
+            self.go.setDisabled(on)  # 편집기는 다운로드 중에도 열 수 있음
             self.upd.setDisabled(on)
 
         def _report(self, pct, msg):
@@ -790,6 +1179,14 @@ def _selfcheck():
     c = build_edit_cmd("ff", "a.mp4", "b.gif", "gif", gif_fps=10, gif_width=320)
     vf = c[c.index("-vf") + 1]
     assert "fps=10" in vf and "scale=320" in vf and "paletteuse" in vf and "-an" in c, c
+    # 편집기: 시간 표시 (parse_time과 왕복), 눈금 간격, 썸네일 명령
+    assert fmt_time(83.456) == "01:23.46" and fmt_time(3723.5) == "1:02:03.50"
+    assert fmt_time(83.9, precise=False) == "01:23" and fmt_time(-1) == "00:00.00"
+    for t in (0, 1.5, 83.46, 3723.5):
+        assert abs(parse_time(fmt_time(t)) - t) < 0.01, t
+    assert tick_step(10, 800) == 1 and tick_step(3600, 800) == 600 and tick_step(0, 800) == 0.5
+    c = build_thumb_cmd("ff", "a.mp4", "/tmp/x", 120, count=24)
+    assert "fps=0.200000,scale=-2:72" in c and c[c.index("-frames:v") + 1] == "24", c
     # 편집: 출력 이름은 덮어쓰지 않음
     with tempfile.TemporaryDirectory() as td:
         src = Path(td) / "clip.mp4"
