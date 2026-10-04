@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- 1 / 7. 오디오(통화녹음) 미디어 읽기 권한 -->
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+
+    <!-- 7 / 7. 삼성 보이스레코더/전화 패키지 가시성 허용 (package visibility, API 30+) -->
+    <queries>
+        <package android:name="com.sec.android.app.voicenote" />
+        <package android:name="com.samsung.android.app.telephonyui" />
+        <package android:name="com.samsung.android.incallui" />
+        <package android:name="com.samsung.android.dialer" />
+        <package android:name="com.android.phone" />
+        <package android:name="com.android.providers.media.module" />
+    </queries>
+
+    <application
+        android:allowBackup="false"
+        android:label="Samsung Probe"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Probe">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
