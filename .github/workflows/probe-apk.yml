@@ -36,11 +36,12 @@ jobs:
 
       - name: Build debug APK
         run: |
+          # 러너가 프로세스 env 로 넣어준 ANDROID_HOME 을 그대로 사용한다.
+          # (step-level env 로 다시 지정하면 빈 값으로 덮일 수 있어 쓰지 않는다.)
+          echo "sdk.dir=${ANDROID_HOME:-$ANDROID_SDK_ROOT}" > local.properties
+          cat local.properties
           chmod +x gradlew
           ./gradlew assembleDebug --stacktrace --no-daemon
-        env:
-          ANDROID_HOME: ${{ env.ANDROID_HOME }}
-          ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
