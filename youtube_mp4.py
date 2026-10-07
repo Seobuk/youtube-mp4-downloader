@@ -2,14 +2,17 @@
 
 exe(PyInstaller) 배포: ffmpeg·deno 내장, 다운로드 실패 시 깃허브 릴리즈에서 자동 업데이트.
 소스 실행: pip install -r requirements.txt  →  python youtube_mp4.py
-(ffmpeg는 PATH에. deno가 PATH에 있으면 전체 화질, 없으면 유튜브가 360p로 제한될 수 있음)
+(ffmpeg는 PATH에. deno나 node 중 하나가 PATH에 있어야 전체 화질 — 둘 다 없으면
+유튜브가 360p로 제한할 수 있음)
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -62,13 +65,26 @@ def find_tool(name):
 def build_format(height=None):
     """화질 상한에 맞는 yt-dlp 포맷 문자열.
     H.264(avc1)+AAC 우선 — 파워포인트 등에서 충돌 없이 재생되는 코덱 조합.
-    그런 조합이 없는 영상(분리 스트림만, m4a 오디오 없음 등)도 받도록 단계적 폴백."""
+    그런 조합이 없는 영상(분리 스트림만, m4a 오디오 없음 등)도 받도록 단계적 폴백.
+    최후 폴백에도 height 상한을 유지한다 — 상한 이하 조합이 없으면 yt-dlp가
+    'Requested format is not available'로 실패하고, 호출자가 사용자에게 안내한다
+    (조용히 4K를 받아버리는 일을 막기 위함)."""
     h = f"[height<={height}]" if height else ""
     return (f"bestvideo{h}[vcodec^=avc1]+bestaudio[ext=m4a]/"
             f"bestvideo{h}[ext=mp4]+bestaudio[ext=m4a]/"
             f"bestvideo{h}+bestaudio/"
             f"best{h}[ext=mp4]/best{h}/"
-            "bestvideo+bestaudio/best")
+            f"bestvideo{h}+bestaudio/best{h}")
+
+
+def find_js_runtime():
+    """유튜브 JS 챌린지(EJS) 해결용 런타임 탐색 → (이름, 경로) 또는 (None, None).
+    deno 우선, 없으면 node를 대체로 사용. 둘 다 없으면 최고화질 포맷을 못 받을 수 있음."""
+    for kind in ("deno", "node"):
+        p = find_tool(kind)
+        if p:
+            return kind, p
+    return None, None
 
 
 def exe_dir():
@@ -91,12 +107,28 @@ def is_cookie_error(err):
     return any(k in e for k in ("cookie", "decrypt", "dpapi", "keyring"))
 
 
+LOG_MAX_BYTES = 5 * 1024 * 1024  # 5MB 넘으면 YoutubeMP4.log.1로 백업 후 새로 시작
+
+
+def _rotate_log(path):
+    """로그가 LOG_MAX_BYTES를 넘으면 .1 백업으로 옮김."""
+    try:
+        if path.is_file() and path.stat().st_size > LOG_MAX_BYTES:
+            bak = path.with_name(path.name + ".1")
+            bak.unlink(missing_ok=True)
+            path.rename(bak)
+    except OSError:
+        pass
+
+
 def write_debug_log(url, errors):
     """실패한 시도 내역을 exe 옆 YoutubeMP4.log에 기록 (안 되면 홈 폴더에). 진단용."""
     from datetime import datetime
     for base in (exe_dir(), Path.home()):
         try:
-            with open(base / "YoutubeMP4.log", "a", encoding="utf-8") as f:
+            logp = base / "YoutubeMP4.log"
+            _rotate_log(logp)
+            with open(logp, "a", encoding="utf-8") as f:
                 f.write(f"\n[{datetime.now():%Y-%m-%d %H:%M:%S}] {APP_VERSION} {url}\n")
                 for label, err in errors:
                     f.write(f"  - {label}: {err}\n")
@@ -105,15 +137,22 @@ def write_debug_log(url, errors):
             continue
 
 
+class AlreadyDownloaded(Exception):
+    """nooverwrites로 건너뛴 파일. args[0] = 이미 있던 파일 경로."""
+
+
 def download(url, out_dir, report, height=None, playlist=None, cookies_from=None,
-             alt_clients=False):
+             alt_clients=False, subtitles=False, audio_only=False, overwrite=False):
     """url을 out_dir에 mp4로 저장. report(pct, msg)로 진행 상황 통지.
     height를 주면 그 해상도 이하 중 최선으로 (용량 조절용).
     재생목록이면 재생목록 제목 폴더를 만들어 전체 다운로드.
     playlist=None이면 URL 형태로 자동 판별, True/False로 강제 지정 가능.
     cookies_from에 브라우저 이름을 주면 그 브라우저의 로그인 쿠키로 인증.
     (exe 옆에 cookies.txt가 있으면 그것을 최우선으로 사용.)
-    alt_clients=True면 유튜브의 모든 재생 클라이언트를 순서대로 시도."""
+    alt_clients=True면 유튜브의 모든 재생 클라이언트를 순서대로 시도.
+    subtitles=True면 한국어·영어 자막(srt)도 함께 저장.
+    audio_only=True면 영상 없이 mp3 음성만 추출.
+    overwrite=False면 같은 이름의 파일이 있을 때 건너뛰고 AlreadyDownloaded 발생."""
     if playlist is None:
         playlist = is_playlist(url)
     name = ("%(playlist_title)s/%(playlist_index)02d %(title)s.%(ext)s"
@@ -125,16 +164,30 @@ def download(url, out_dir, report, height=None, playlist=None, cookies_from=None
         "progress_hooks": [lambda d: report(*hook_status(d))],
         "noplaylist": not playlist,
         "ignoreerrors": playlist,  # 재생목록 중 막힌 영상(비공개 등)은 건너뛰고 계속
+        "nooverwrites": not overwrite,  # 같은 파일이 있으면 덮지 않고 건너뜀
         "quiet": True,
         "noprogress": True,  # 진행률은 progress_hooks로만 (windowed exe엔 콘솔 없음)
         "no_warnings": True,
         "ffmpeg_location": find_tool("ffmpeg"),
     }
-    deno = find_tool("deno")
-    if deno:
-        # 최신 유튜브는 JS 챌린지(EJS)를 풀어야 전체 화질 포맷을 줌 — deno로 해결.
-        # 없으면 yt-dlp가 360p 폴백이나 '포맷 없음'으로 떨어짐.
-        opts["js_runtimes"] = {"deno": {"path": deno}}
+    if audio_only:
+        opts["format"] = "bestaudio/best"
+        opts["postprocessors"] = [{"key": "FFmpegExtractAudio",
+                                   "preferredcodec": "mp3", "preferredquality": "192"}]
+        opts.pop("merge_output_format", None)
+    if subtitles:
+        opts["writesubtitles"] = True
+        opts["subtitleslangs"] = ["ko", "en"]
+        opts["subtitlesformat"] = "srt"
+    runtimes = {}
+    for kind in ("deno", "node"):
+        # 최신 유튜브는 JS 챌린지(EJS)를 풀어야 전체 화질 포맷을 줌.
+        # deno 우선, 없으면 node 대체. 둘 다 없으면 360p 폴백이나 '포맷 없음'으로 떨어짐.
+        p = find_tool(kind)
+        if p:
+            runtimes[kind] = {"path": p}
+    if runtimes:
+        opts["js_runtimes"] = runtimes  # dict 순서 = 우선순위
     if alt_clients:
         # 기본 클라이언트에서 'not available'인 영상도 다른 클라이언트엔 있을 수 있음
         opts["extractor_args"] = {"youtube": {"player_client": ["all"]}}
@@ -143,16 +196,26 @@ def download(url, out_dir, report, height=None, playlist=None, cookies_from=None
         opts["cookiefile"] = str(cookie_txt)  # 수동 쿠키 파일이 항상 최우선
     elif cookies_from:
         opts["cookiesfrombrowser"] = (cookies_from,)
+    t0 = time.time()  # nooverwrites 건너뜀 판별용 (이번 실행에 받은 파일인지)
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
     if playlist:
-        done = [e for e in info.get("entries") or [] if e]
-        report(100, f"완료: 재생목록 '{info.get('title', '')}' 영상 {len(done)}개")
+        entries = info.get("entries") or []
+        done = [e for e in entries if e]
+        skipped = len(entries) - len(done)
+        msg = f"완료: 재생목록 '{info.get('title', '')}' 영상 {len(done)}개"
+        if skipped:
+            msg += f" (건너뜀 {skipped}개 — 비공개·차단 등)"
+        report(100, msg)
         return None
-    report(100, f"완료: {info.get('title', '')}.mp4")
-    # 편집 탭에 바로 넘길 수 있게 저장된 파일 경로 반환
-    return next((d.get("filepath") for d in info.get("requested_downloads") or []
+    path = next((d.get("filepath") for d in info.get("requested_downloads") or []
                  if d.get("filepath")), None)
+    if (path and not overwrite and os.path.exists(path)
+            and os.path.getmtime(path) < t0):
+        raise AlreadyDownloaded(path)  # 이번 실행에 받지 않고 기존 파일 건너뜀
+    report(100, f"완료: {Path(path).name if path else info.get('title', '')}")
+    # 편집 탭에 바로 넘길 수 있게 저장된 파일 경로 반환 (오디오만 모드는 제외)
+    return None if audio_only else path
 
 
 def update_ytdlp(report):
@@ -185,11 +248,16 @@ def latest_release():
 
 
 def swap_exe(exe, new):
-    """실행 중인 exe를 new로 교체. 기존 파일은 .old로 보관 (다음 실행 때 정리)."""
+    """실행 중인 exe를 new로 교체. 기존 파일은 .old로 보관 (다음 실행 때 정리).
+    교체 중 실패하면(백신 잠금 등) 원래 파일로 되돌리고 예외를 다시 발생시킨다."""
     old = exe.with_name(exe.stem + ".old.exe")
     old.unlink(missing_ok=True)
     exe.rename(old)  # 윈도우도 실행 중인 exe의 rename은 허용됨
-    new.rename(exe)
+    try:
+        new.rename(exe)
+    except OSError:
+        old.rename(exe)  # 되돌리기 — exe도 new도 없는 상태를 막음
+        raise
     if os.name != "nt":
         exe.chmod(0o755)  # 리눅스: 새로 받은 파일엔 실행 비트가 없음
 
@@ -214,6 +282,47 @@ def update_app(report, skip_same=False):
             report(0, "릴리즈 접근 실패(404) — 깃허브 저장소가 비공개면 공개로 전환해야 합니다")
             return False
         raise
+
+
+def _verify_download(path, expected_size):
+    """받은 업데이트 파일의 무결성 검증 → (통과 여부, 사유).
+    릴리즈 에셋 크기 + 실행 파일 매직 바이트로 부분 다운로드·에러페이지를 걸러냄."""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return False, "파일이 없습니다"
+    if size == 0:
+        return False, "빈 파일입니다"
+    if expected_size and size != expected_size:
+        return False, f"크기 불일치 (받음 {size}, 예상 {expected_size})"
+    with open(path, "rb") as f:
+        magic = f.read(4)
+    good = magic[:2] == b"MZ" if os.name == "nt" else magic == b"\x7fELF"
+    if not good:
+        return False, "실행 파일 형식이 아닙니다 (다운로드 손상 의심)"
+    return True, ""
+
+
+def _fetch_sha256(asset):
+    """릴리즈에 '<에셋명>.sha256' 파일이 있으면 체크섬 문자열 반환, 없으면 None.
+    (릴리즈 워크플로우에서 sha256 에셋을 올리면 자동으로 활용됨)"""
+    try:
+        req = urllib.request.Request(asset["browser_download_url"] + ".sha256",
+                                     headers={"User-Agent": EXE_NAME})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            text = r.read(256).decode("utf-8", "replace").strip()
+        return text.split()[0].lower() if text else None
+    except Exception:
+        return None
+
+
+def _sha256_of(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(1 << 20):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def _update_app(report, skip_same):
@@ -241,6 +350,16 @@ def _update_app(report, skip_same):
             done += len(chunk)
             pct = done / total * 100 if total else 0
             report(pct, f"{tag} 받는 중... {pct:3.0f}%")
+    # 교체 전 무결성 검증 — 부분 다운로드된 파일이 정상 exe를 대체하는 것을 막음
+    ok, why = _verify_download(new, total)
+    if ok:
+        want = _fetch_sha256(asset)
+        if want and _sha256_of(new) != want:
+            ok, why = False, "SHA256 체크섬 불일치"
+    if not ok:
+        new.unlink(missing_ok=True)
+        report(0, f"업데이트 파일 검증 실패 ({why}) — 기존 버전을 유지합니다")
+        return False
     swap_exe(exe, new)
     subprocess.Popen([str(exe)])
     report(100, f"{tag} 교체 완료 — 새 창이 열립니다")
@@ -272,12 +391,16 @@ def parse_time(s):
     return sec
 
 
+_COUNTER_RE = re.compile(r" \(\d+\)$")  # 이름 끝의 ' (2)' 카운터만 매칭
+
+
 def unique_path(p):
-    """p가 이미 있으면 'name (2).ext' 식으로 비어 있는 이름을 찾음 (덮어쓰기 방지)."""
+    """p가 이미 있으면 'name (2).ext' 식으로 비어 있는 이름을 찾음 (덮어쓰기 방지).
+    이름에 원래 있던 괄호('my (video).mp4')는 건드리지 않고 진짜 카운터만 교체한다."""
     p = Path(p)
     n = 2
     while p.exists():
-        p = p.with_name(f"{p.stem.rsplit(' (', 1)[0]} ({n}){p.suffix}")
+        p = p.with_name(f"{_COUNTER_RE.sub('', p.stem)} ({n}){p.suffix}")
         n += 1
     return p
 
@@ -800,12 +923,20 @@ def _make_editor_class():
     return Editor
 
 
+def _looks_like_youtube(t):
+    """유튜브 영상/재생목록 URL처럼 보이는지 (드래그앤드롭·클립보드 감지용)."""
+    t = (t or "").strip()
+    return bool(t) and any(k in t for k in ("youtu.be/", "youtube.com/watch",
+                                            "youtube.com/playlist", "youtube.com/shorts/"))
+
+
 def run_gui(exec_=True):
     """GUI 실행. exec_=False면 이벤트 루프를 돌리지 않고 (app, win) 반환 (테스트용)."""
-    from PyQt6.QtCore import pyqtSignal
+    from PyQt6.QtCore import QEvent, QSettings, pyqtSignal
     from PyQt6.QtWidgets import (
-        QApplication, QComboBox, QFileDialog, QGroupBox, QHBoxLayout, QLabel,
-        QLineEdit, QMessageBox, QProgressBar, QPushButton, QVBoxLayout, QWidget,
+        QApplication, QCheckBox, QComboBox, QFileDialog, QGroupBox, QHBoxLayout, QLabel,
+        QLineEdit, QListWidget, QMessageBox, QProgressBar, QPushButton, QVBoxLayout,
+        QWidget,
     )
 
     cleanup_old_exe()
@@ -816,12 +947,16 @@ def run_gui(exec_=True):
         done_signal = pyqtSignal()
         restart_signal = pyqtSignal()  # 자동 업데이트 후 앱 종료 (새 exe가 이미 실행됨)
         file_signal = pyqtSignal(str)  # 다운로드 완료 파일 -> 편집 원본 칸
+        update_signal = pyqtSignal(str)  # 시작 시 새 버전 발견 -> 업데이트 문의
 
         def __init__(self):
             super().__init__()
             self.setWindowTitle("유튜브 → MP4")
             self.setFixedWidth(520)
+            self.setAcceptDrops(True)  # URL 드래그앤드롭
             self._last_pct = -1
+            self._queue = []  # 다운로드 큐: dict(url, out_dir, height, ...) 목록
+            self.settings = QSettings("Seobuk", "YoutubeMP4")
 
             self.url = QLineEdit(placeholderText="https://youtu.be/... 또는 재생목록 링크")
             self.dir = QLineEdit(str(Path.home() / "Downloads"))
@@ -830,11 +965,20 @@ def run_gui(exec_=True):
             for label, h in [("최고 화질", None), ("1080p", 1080), ("720p", 720),
                              ("480p", 480), ("360p", 360)]:
                 self.quality.addItem(label, h)
+            self.subs = QCheckBox("자막 함께 저장 (한·영)")
+            self.audio = QCheckBox("오디오만 추출 (mp3)")
+            self.overwrite = QCheckBox("같은 파일 덮어쓰기")
             self.go = QPushButton("MP4 다운로드", clicked=self.start_download)
             self.go.setStyleSheet(
                 "background:#e63946; color:#fff; font-weight:600;"
                 "padding:10px; border:0; border-radius:6px;"
             )
+            # 다운로드 큐
+            self.qlist = QListWidget()
+            self.qlist.setMaximumHeight(84)
+            self.qadd = QPushButton("＋ 큐에 추가", clicked=self.queue_add)
+            self.qdel = QPushButton("－ 제거", clicked=self.queue_remove)
+            self.qclr = QPushButton("지우기", clicked=self.queue_clear)
             self.bar = QProgressBar(textVisible=False)
             self.bar.setRange(0, 100)
             self.bar.setFixedHeight(8)
@@ -844,6 +988,7 @@ def run_gui(exec_=True):
             frozen = getattr(sys, "frozen", False)
             self.upd = QPushButton("업데이트 확인" if frozen else "yt-dlp 업데이트",
                                    clicked=self.start_update)
+            self.autoupd = QCheckBox("시작 시 자동 업데이트 확인")
 
             root = QVBoxLayout(self)
             root.addWidget(QLabel("유튜브 링크"))
@@ -855,6 +1000,20 @@ def run_gui(exec_=True):
             root.addLayout(row)
             root.addWidget(QLabel("화질 (낮출수록 용량 작음 · mp4/H.264라 PPT 삽입 가능)"))
             root.addWidget(self.quality)
+            opt = QHBoxLayout()
+            opt.addWidget(self.subs)
+            opt.addWidget(self.audio)
+            opt.addWidget(self.overwrite)
+            opt.addStretch()
+            root.addLayout(opt)
+            root.addWidget(QLabel("다운로드 큐 (여러 링크를 쌓아두고 한 번에)"))
+            root.addWidget(self.qlist)
+            qrow = QHBoxLayout()
+            qrow.addWidget(self.qadd)
+            qrow.addWidget(self.qdel)
+            qrow.addWidget(self.qclr)
+            qrow.addStretch()
+            root.addLayout(qrow)
             root.addWidget(self.go)
             root.addWidget(self._build_edit_box())
             root.addWidget(self.bar)
@@ -862,13 +1021,63 @@ def run_gui(exec_=True):
             foot = QHBoxLayout()
             foot.addWidget(ver)
             foot.addStretch()
+            foot.addWidget(self.autoupd)
             foot.addWidget(self.upd)
             root.addLayout(foot)
 
+            self._restore_settings()
             self.status_signal.connect(self._on_status)
             self.done_signal.connect(lambda: self._busy(False))
             self.restart_signal.connect(QApplication.instance().quit)
             self.file_signal.connect(self.src.setText)
+            self.update_signal.connect(self._on_update_available)
+
+        def _restore_settings(self):
+            """QSettings에서 저장 폴더·화질·옵션 복원."""
+            s = self.settings
+            self.dir.setText(s.value("out_dir", str(Path.home() / "Downloads")))
+            try:
+                self.quality.setCurrentIndex(int(s.value("quality_idx", 0) or 0))
+            except (TypeError, ValueError):
+                pass
+            self.subs.setChecked(s.value("subtitles", False, type=bool))
+            self.audio.setChecked(s.value("audio_only", False, type=bool))
+            self.overwrite.setChecked(s.value("overwrite", False, type=bool))
+            self.autoupd.setChecked(s.value("auto_update", True, type=bool))
+
+        def _save_settings(self):
+            s = self.settings
+            s.setValue("out_dir", self.dir.text())
+            s.setValue("quality_idx", self.quality.currentIndex())
+            s.setValue("subtitles", self.subs.isChecked())
+            s.setValue("audio_only", self.audio.isChecked())
+            s.setValue("overwrite", self.overwrite.isChecked())
+            s.setValue("auto_update", self.autoupd.isChecked())
+
+        # ---- URL 드래그앤드롭 / 클립보드 감지 ----
+        def dragEnterEvent(self, e):
+            if e.mimeData().hasText() or e.mimeData().hasUrls():
+                e.acceptProposedAction()
+
+        def dropEvent(self, e):
+            url = ""
+            if e.mimeData().hasUrls():
+                url = e.mimeData().urls()[0].toString()
+            else:
+                parts = e.mimeData().text().strip().split()
+                url = next((p for p in parts if _looks_like_youtube(p)),
+                           parts[0] if parts else "")
+            if _looks_like_youtube(url):
+                self.url.setText(url)
+                e.acceptProposedAction()
+
+        def changeEvent(self, e):
+            if (e.type() == QEvent.Type.ActivationChange and self.isActiveWindow()
+                    and not self.url.text().strip()):
+                t = QApplication.clipboard().text().strip()
+                if _looks_like_youtube(t):
+                    self.url.setText(t)
+            super().changeEvent(e)
 
         def _build_edit_box(self):
             """영상 편집: 편집기 창에서 화면을 보며 구간 지정 → 자르기 / WMV / GIF."""
@@ -924,68 +1133,156 @@ def run_gui(exec_=True):
                 return True
             return None
 
-        def start_download(self):
+        # ---- 다운로드 큐 ----
+        def _current_job(self, url):
+            """현재 UI 설정을 작업 dict로 스냅샷."""
+            return {"url": url, "out_dir": self.dir.text(),
+                    "height": self.quality.currentData(),
+                    "subtitles": self.subs.isChecked(),
+                    "audio_only": self.audio.isChecked(),
+                    "overwrite": self.overwrite.isChecked(),
+                    "playlist": None}
+
+        def queue_add(self):
             url = self.url.text().strip()
             if not url:
                 return self._on_status(0, "링크를 입력하세요")
+            self._queue.append(self._current_job(url))
+            self.qlist.addItem(f"{len(self._queue)}. {url}")
+            self.url.clear()
+            self._save_settings()
+
+        def queue_remove(self):
+            row = self.qlist.currentRow()
+            if row >= 0:
+                self.qlist.takeItem(row)
+                del self._queue[row]
+                for i in range(self.qlist.count()):
+                    item = self.qlist.item(i)
+                    item.setText(f"{i + 1}." + item.text().split(".", 1)[1])
+
+        def queue_clear(self):
+            self._queue.clear()
+            self.qlist.clear()
+
+        def _confirm(self, title, text):
+            """예/아니오 확인 다이얼로그 → True면 진행."""
+            box = QMessageBox(self)
+            box.setWindowTitle(title)
+            box.setText(text)
+            yes = box.addButton("계속", QMessageBox.ButtonRole.YesRole)
+            box.addButton("취소", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            return box.clickedButton() is yes
+
+        def start_download(self):
+            jobs = list(self._queue)
+            url = self.url.text().strip()
+            if url:
+                jobs.append(self._current_job(url))
+            if not jobs:
+                return self._on_status(0, "링크를 입력하거나 큐에 추가하세요")
             if not find_tool("ffmpeg"):
                 return self._on_status(0, "ffmpeg가 없습니다 (병합 불가)")
-            playlist = None  # URL 형태로 자동 판별
-            if "list=" in url and not is_playlist(url):
-                playlist = self._ask_playlist_scope()
-                if playlist is None:
-                    return  # 취소
-            out_dir = self.dir.text()
-            height = self.quality.currentData()
+            # 재생목록 범위 사전 확인 (GUI 스레드에서 — 워커에서는 묻지 않음)
+            for job in jobs:
+                if "list=" in job["url"] and not is_playlist(job["url"]):
+                    scope = self._ask_playlist_scope()
+                    if scope is None:
+                        return  # 취소
+                    job["playlist"] = scope
+            # JS 런타임 경고 — deno/node이 없고 고화질을 고르면 제한될 수 있음
+            js_kind, _ = find_js_runtime()
+            wants_hq = any(j["height"] is None or j["height"] > 360 for j in jobs)
+            if not js_kind and wants_hq and not self._confirm(
+                    "JS 런타임 없음",
+                    "deno/node이 없어 유튜브가 360p 이하로 제한할 수 있습니다.\n"
+                    "deno를 설치하면 최고화질까지 받을 수 있습니다.\n계속할까요?"):
+                return
+            # 디스크 여유 공간 확인 (단일 500MB / 여러 건·재생목록 2GB 기준)
+            try:
+                free_mb = shutil.disk_usage(jobs[0]["out_dir"]).free // (1 << 20)
+            except OSError:
+                free_mb = None
+            bulk = len(jobs) > 1 or any(is_playlist(j["url"]) for j in jobs)
+            need_mb = 2000 if bulk else 500
+            if (free_mb is not None and free_mb < need_mb and not self._confirm(
+                    "디스크 공간 부족",
+                    f"여유 공간이 {free_mb}MB뿐입니다 (권장 {need_mb}MB 이상).\n"
+                    "계속하면 중간에 실패할 수 있습니다. 계속할까요?")):
+                return
+            self._save_settings()
 
             def work(report):
                 errors = []
 
-                def attempt(label, **kw):
+                def attempt(job, label, **kw):
                     if label:
                         report(0, label)
                     try:
-                        path = download(url, out_dir, report, height, playlist, **kw)
+                        path = download(job["url"], job["out_dir"], report,
+                                        job["height"], job["playlist"], **kw,
+                                        subtitles=job["subtitles"],
+                                        audio_only=job["audio_only"],
+                                        overwrite=job["overwrite"])
                         if path:
                             self.file_signal.emit(path)
+                        return True
+                    except AlreadyDownloaded as e:
+                        # 같은 파일이 있어 건너뜀 — 실패가 아니므로 성공 처리
+                        report(100, f"건너뜀 (이미 있음): {Path(e.args[0]).name}")
                         return True
                     except Exception as e:
                         errors.append((label or "기본 시도", str(e)))
                         return False
 
-                if attempt(None):
+                total_jobs = len(jobs)
+                for i, job in enumerate(jobs):
+                    prefix = f"[{i + 1}/{total_jobs}] " if total_jobs > 1 else ""
+                    job_report = (lambda p, m, _p=prefix:
+                                  report(p, _p + m)) if prefix else report
+                    if attempt(job, None):
+                        continue
+                    first_err = errors[0][1]
+                    # 유튜브가 비로그인 클라이언트만 막는 오류(연령 제한, 403 등)면 재시도.
+                    # 'not available'류는 로그인 문제가 아닌 경우가 대부분이라
+                    # 빠른 전체 클라이언트 시도를 먼저, 브라우저 쿠키는 그다음.
+                    if needs_login_retry(first_err):
+                        ok = attempt(job, "다른 재생 클라이언트로 재시도 중... (시간이 걸릴 수 있음)",
+                                     alt_clients=True)
+                        if not ok:
+                            good_browser = None
+                            for browser in ("chrome", "edge", "firefox"):
+                                if attempt(job, f"{browser} 로그인 정보로 재시도 중...",
+                                           cookies_from=browser):
+                                    ok = True
+                                    break
+                                if not is_cookie_error(errors[-1][1]):
+                                    # 쿠키는 읽었는데도 차단 → 다른 브라우저도 같은 계정
+                                    good_browser = browser
+                                    break
+                            if not ok and good_browser:
+                                ok = attempt(job, "쿠키 + 전체 클라이언트로 재시도 중...",
+                                             cookies_from=good_browser, alt_clients=True)
+                        if ok:
+                            continue
+                    write_debug_log(job["url"], errors)  # 진단용: 시도 내역을 YoutubeMP4.log에
+                    # exe에서 실패하면 yt-dlp가 낡았을 수 있음 → 새 릴리즈 있으면 자동 교체
+                    if getattr(sys, "frozen", False):
+                        try:
+                            report(0, f"오류: {first_err} — 새 버전 확인 중...")
+                            if update_app(report, skip_same=True):
+                                return True
+                        except Exception:
+                            pass  # 업데이트 확인 실패 시 원래 오류 표시
+                    if "requested format" in first_err.lower():
+                        # B3: 화질 상한 이하 조합이 없음 — 조용히 낮은 화질로 받지 않고 안내
+                        report(0, "오류: 선택한 화질 이하의 형식을 찾을 수 없습니다. "
+                                  "'최고 화질'로 다시 시도하거나 deno/node 설치를 확인하세요.")
+                    else:
+                        report(0, f"오류: {first_err}")
                     return
-                first_err = errors[0][1]
-                # 유튜브가 비로그인 클라이언트만 막는 오류(연령 제한, 403 등)면 재시도.
-                # 'not available'류는 로그인 문제가 아닌 경우가 대부분이라
-                # 빠른 전체 클라이언트 시도를 먼저, 브라우저 쿠키는 그다음.
-                if needs_login_retry(first_err):
-                    if attempt("다른 재생 클라이언트로 재시도 중... (시간이 걸릴 수 있음)",
-                               alt_clients=True):
-                        return
-                    good_browser = None
-                    for browser in ("chrome", "edge", "firefox"):
-                        if attempt(f"{browser} 로그인 정보로 재시도 중...",
-                                   cookies_from=browser):
-                            return
-                        if not is_cookie_error(errors[-1][1]):
-                            # 쿠키는 읽었는데도 차단 → 다른 브라우저도 같은 계정
-                            good_browser = browser
-                            break
-                    if good_browser and attempt(
-                            "쿠키 + 전체 클라이언트로 재시도 중...",
-                            cookies_from=good_browser, alt_clients=True):
-                        return
-                write_debug_log(url, errors)  # 진단용: 시도 내역을 YoutubeMP4.log에
-                # exe에서 실패하면 yt-dlp가 낡았을 수 있음 → 새 릴리즈 있으면 자동 교체
-                if getattr(sys, "frozen", False):
-                    try:
-                        report(0, f"오류: {first_err} — 새 버전 확인 중...")
-                        if update_app(report, skip_same=True):
-                            return True
-                    except Exception:
-                        pass  # 업데이트 확인 실패 시 원래 오류 표시
-                report(0, f"오류: {first_err}")
+                report(100, f"완료: {total_jobs}건 처리됨" if total_jobs > 1 else "완료")
 
             self._run(work)
 
@@ -1015,6 +1312,20 @@ def run_gui(exec_=True):
         def _busy(self, on):
             self.go.setDisabled(on)  # 편집기는 다운로드 중에도 열 수 있음
             self.upd.setDisabled(on)
+            self.qadd.setDisabled(on)
+            self.qdel.setDisabled(on)
+            self.qclr.setDisabled(on)
+
+        def _on_update_available(self, tag):
+            """시작 시 자동 업데이트 확인에서 새 버전을 찾으면 문의."""
+            box = QMessageBox(self)
+            box.setWindowTitle("업데이트")
+            box.setText(f"새 버전 {tag}이 있습니다. 업데이트할까요?")
+            yes = box.addButton("업데이트", QMessageBox.ButtonRole.YesRole)
+            box.addButton("나중에", QMessageBox.ButtonRole.NoRole)
+            box.exec()
+            if box.clickedButton() is yes:
+                self._run(update_app)
 
         def _report(self, pct, msg):
             # 다운로드 진행 틱을 1% 단위로 스로틀 (시그널 폭주 방지)
@@ -1033,6 +1344,16 @@ def run_gui(exec_=True):
     win.show()
     if not exec_:
         return app, win
+    if getattr(sys, "frozen", False) and win.autoupd.isChecked():
+        # 시작 시 자동 업데이트 확인 (백그라운드, 실패해도 조용히 무시)
+        def _bg_update_check():
+            try:
+                tag, asset = latest_release()
+            except Exception:
+                return
+            if tag and asset and tag != APP_VERSION:
+                win.update_signal.emit(tag)
+        threading.Thread(target=_bg_update_check, daemon=True).start()
     sys.exit(app.exec())
 
 
@@ -1080,22 +1401,80 @@ def _selfcheck():
         captured.clear()
         download("https://youtu.be/x", ".", lambda p, m: None)
         assert "cookiesfrombrowser" not in captured
-        # deno가 있으면 js_runtimes로 전달 (전체 화질 포맷의 핵심), 없으면 미설정
+        # deno가 있으면 js_runtimes로 전달 (전체 화질 포맷의 핵심), 없으면 node 대체,
+        # 둘 다 없으면 미설정
         orig_which = shutil.which
-        shutil.which = lambda n: r"C:\x\deno.exe" if n == "deno" else orig_which(n)
+        shutil.which = lambda n: (r"C:\x\deno.exe" if n == "deno"
+                                  else r"C:\x\node.exe" if n == "node"
+                                  else orig_which(n))
         try:
             captured.clear()
             download("https://youtu.be/x", ".", lambda p, m: None)
-            assert captured["js_runtimes"] == {"deno": {"path": r"C:\x\deno.exe"}}, captured
+            assert captured["js_runtimes"] == {"deno": {"path": r"C:\x\deno.exe"},
+                                                  "node": {"path": r"C:\x\node.exe"}}, captured
+            assert find_js_runtime() == ("deno", r"C:\x\deno.exe")
         finally:
             shutil.which = orig_which
-        shutil.which = lambda n: None if n == "deno" else orig_which(n)
+        shutil.which = lambda n: r"C:\x\node.exe" if n == "node" else orig_which(n)
+        try:
+            captured.clear()
+            download("https://youtu.be/x", ".", lambda p, m: None)
+            assert captured["js_runtimes"] == {"node": {"path": r"C:\x\node.exe"}}, captured
+            assert find_js_runtime() == ("node", r"C:\x\node.exe")  # deno 대체
+        finally:
+            shutil.which = orig_which
+        shutil.which = lambda n: None if n in ("deno", "node") else orig_which(n)
         try:
             captured.clear()
             download("https://youtu.be/x", ".", lambda p, m: None)
             assert "js_runtimes" not in captured
+            assert find_js_runtime() == (None, None)
         finally:
             shutil.which = orig_which
+        # 자막/오디오전용/덮어쓰기 옵션이 yt-dlp에 반영되는지
+        captured.clear()
+        download("https://youtu.be/x", ".", lambda p, m: None,
+                 subtitles=True, audio_only=True, overwrite=True)
+        assert captured["writesubtitles"] is True, captured
+        assert captured["subtitleslangs"] == ["ko", "en"], captured
+        assert captured["format"] == "bestaudio/best", captured
+        assert captured["postprocessors"][0]["key"] == "FFmpegExtractAudio", captured
+        assert "merge_output_format" not in captured, captured
+        assert captured["nooverwrites"] is False, captured
+        captured.clear()
+        download("https://youtu.be/x", ".", lambda p, m: None)
+        assert captured["nooverwrites"] is True, captured
+        assert "writesubtitles" not in captured, captured
+        # nooverwrites로 건너뛴 파일은 AlreadyDownloaded (이번 실행에 받지 않은 파일)
+        with tempfile.TemporaryDirectory() as td:
+            old_file = Path(td) / "v.mp4"
+            old_file.write_text("old")
+            os.utime(old_file, (1, 1))  # mtime을 과거로 — 이번 실행에 받지 않음
+            captured.clear()
+            orig_extract = FakeYDL.extract_info
+
+            def fake_extract(self, url, download):
+                return {"title": "v",
+                        "requested_downloads": [{"filepath": str(old_file)}]}
+            FakeYDL.extract_info = fake_extract
+            try:
+                try:
+                    download("https://youtu.be/x", td, lambda p, m: None)
+                    raise AssertionError("AlreadyDownloaded 미발생")
+                except AlreadyDownloaded as e:
+                    assert e.args[0] == str(old_file)
+            finally:
+                FakeYDL.extract_info = orig_extract
+        # 재생목록 건너뜀 리포트: 실패한 항목(None) 개수 표시
+        msgs = []
+        FakeYDL.extract_info = lambda self, url, download: {
+            "title": "pl", "entries": [{"id": 1}, None, {"id": 3}]}
+        try:
+            download("https://www.youtube.com/playlist?list=PLx", ".",
+                     lambda p, m: msgs.append(m), playlist=True)
+        finally:
+            FakeYDL.extract_info = orig_extract
+        assert any("2개" in m and "건너뜀 1개" in m for m in msgs), msgs
         # alt_clients=True면 모든 재생 클라이언트 시도 옵션이 켜져야 함
         captured.clear()
         download("https://youtu.be/x", ".", lambda p, m: None, alt_clients=True)
@@ -1127,14 +1506,15 @@ def _selfcheck():
     p, m = hook_status({"status": "downloading", "downloaded_bytes": 50,
                         "total_bytes": 100, "speed": 2e6})  # 단일 영상은 그대로
     assert p == 50 and m.startswith("다운로드 중"), (p, m)
-    # 포맷 문자열: H.264(avc1) 우선, 화질 상한 반영, 코덱 불문 병합 폴백, 최후엔 무조건 best
+    # 포맷 문자열: H.264(avc1) 우선, 화질 상한 반영, 코덱 불문 병합 폴백.
+    # 최후 폴백에도 화질 상한 유지 — 상한 이하 조합이 없으면 실패 후 안내 (B3).
     f = build_format()
     assert f.startswith("bestvideo[vcodec^=avc1]") and f.endswith("/best"), f
     assert "bestvideo+bestaudio/" in f, f
     f = build_format(720)
     assert "bestvideo[height<=720][vcodec^=avc1]" in f and "best[height<=720]/" in f, f
     assert "bestvideo[height<=720]+bestaudio/" in f, f
-    assert f.endswith("bestvideo+bestaudio/best"), f  # 최후 폴백은 화질 제한도 해제
+    assert f.endswith("bestvideo[height<=720]+bestaudio/best[height<=720]"), f
     # exe(frozen)에서는 pip를 실행하지 않고 안내만 해야 함
     msgs = []
     sys.frozen = True
@@ -1161,6 +1541,68 @@ def _selfcheck():
         assert exe.read_text() == "new"
         assert (Path(td) / "app.old.exe").read_text() == "old"
         assert not new.exists()
+    # swap_exe 교체 실패(B5): 두 번째 rename이 실패하면 원래 파일로 복구
+    with tempfile.TemporaryDirectory() as td:
+        exe, new = Path(td) / "app.exe", Path(td) / "app.new.exe"
+        exe.write_text("old"), new.write_text("new")
+        orig_rename = Path.rename
+        calls = []
+
+        def flaky_rename(self, target):
+            calls.append(str(target))
+            if len(calls) == 2:  # new -> exe 단계에서 실패 시뮬레이션
+                raise OSError("백신 잠금 시뮬레이션")
+            return orig_rename(self, target)
+        Path.rename = flaky_rename
+        try:
+            swap_exe(exe, new)
+            raise AssertionError("OSError 미발생")
+        except OSError:
+            pass
+        finally:
+            Path.rename = orig_rename
+        assert exe.read_text() == "old", "원래 exe가 복구되어야 함"
+    # _verify_download: 크기 불일치·빈 파일·매직바이트 검증 (B1)
+    with tempfile.TemporaryDirectory() as td:
+        good = Path(td) / "app.exe"
+        magic = b"MZ" + b"\x00" * 62 if os.name == "nt" else b"\x7fELF" + b"\x00" * 60
+        good.write_bytes(magic)
+        ok, _ = _verify_download(good, 64)
+        assert ok
+        ok, why = _verify_download(good, 999)
+        assert not ok and "크기 불일치" in why, why
+        bad = Path(td) / "bad.exe"
+        bad.write_bytes(b"<html>error page")
+        ok, why = _verify_download(bad, len(b"<html>error page"))
+        assert not ok and "실행 파일 형식" in why, why
+        ok, why = _verify_download(Path(td) / "nope.exe", 10)
+        assert not ok
+    # _rotate_log: 5MB 초과 시 .1 백업 후 새로 시작 (B6)
+    with tempfile.TemporaryDirectory() as td:
+        logp = Path(td) / "YoutubeMP4.log"
+        logp.write_bytes(b"x" * (LOG_MAX_BYTES + 1))
+        _rotate_log(logp)
+        assert not logp.exists()
+        assert (Path(td) / "YoutubeMP4.log.1").stat().st_size == LOG_MAX_BYTES + 1
+        small = Path(td) / "s.log"
+        small.write_text("a")
+        _rotate_log(small)  # 작은 파일은 그대로
+        assert small.read_text() == "a"
+    # unique_path: 이름에 원래 있던 괄호는 건드리지 않음 (B2 회귀)
+    with tempfile.TemporaryDirectory() as td:
+        (Path(td) / "my (video).mp4").touch()
+        assert unique_path(Path(td) / "my (video).mp4").name == "my (video) (2).mp4"
+        (Path(td) / "my (video) (2).mp4").touch()
+        assert unique_path(Path(td) / "my (video).mp4").name == "my (video) (3).mp4"
+        (Path(td) / "plain.mp4").touch()
+        assert unique_path(Path(td) / "plain.mp4").name == "plain (2).mp4"
+    # _looks_like_youtube: 드래그앤드롭·클립보드 감지용
+    assert _looks_like_youtube("https://youtu.be/abc123")
+    assert _looks_like_youtube("https://www.youtube.com/watch?v=abc123")
+    assert _looks_like_youtube("https://www.youtube.com/playlist?list=PLx")
+    assert _looks_like_youtube("https://www.youtube.com/shorts/abc")
+    assert not _looks_like_youtube("https://example.com/video")
+    assert not _looks_like_youtube("")
     # 편집: 시간 파싱
     assert parse_time("") is None and parse_time("90") == 90
     assert parse_time("1:30") == 90 and parse_time("0:01:30.5") == 90.5
